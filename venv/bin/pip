@@ -1,4 +1,4 @@
-#!/home/raspberrypi/Sputter_vacuumctrl/venv/bin/python3
+#!/home/raspberrypi/Sputter_ctrl/venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys
