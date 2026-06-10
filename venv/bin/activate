@@ -38,7 +38,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV=/home/raspberrypi/Sputter_vacuumctrl/venv
+VIRTUAL_ENV=/home/raspberrypi/Sputter_ctrl/venv
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"
