@@ -3,10 +3,13 @@ from adafruit_ads1x15.analog_in import AnalogIn
 from config import (
     ADC_VREF,
     MFC_FULL_SCALE,
+    MFC_SETPOINT_VOLTAGE_FULL_SCALE,
     MFC_GAS_CORRECTION_FACTOR,
     ADC_CHANNEL_MFC,
     GPIO_MFC_VALVE_CLOSE_PIN,
     ARGON_DAC_I2C_ADDRESS,
+    ARGON_DAC_VREF,
+    ARGON_DAC_RESOLUTION,
 )
 
 
@@ -25,16 +28,69 @@ class MFCController:
         # Initialize valve close pin (default: released)
         GPIO.setup(self.valve_close_pin, GPIO.IN)
 
-        # Placeholder for DAC initialization on the shared I2C bus.
-        # TODO: replace with actual DAC driver when hardware details are known.
-        # Example: self.dac = SomeDAC(self.i2c, address=self.dac_address)
+        # Configure the DAC if we have an I2C bus.
+        self.dac_ready = False
+
+        self.dac_voltage = 0.0
+        self.dac_code = 0
+        if self.i2c is not None:
+            i2c_locked = False
+            try:
+                i2c_locked = self.i2c.try_lock()
+                if i2c_locked:
+                    addrs = self.i2c.scan()
+                    self.dac_ready = self.dac_address in addrs
+            except Exception:
+                self.dac_ready = False
+            finally:
+                if i2c_locked:
+                    try:
+                        self.i2c.unlock()
+                    except Exception:
+                        pass
 
     def set_flow(self, sccm):
-        """Set the argon MFC flow target via the DAC (placeholder)."""
-        self.flow_target = float(sccm)
-        # TODO: write the target to the DAC when hardware/address details are available.
-        # if self.i2c is not None:
-        #     self.dac.set_voltage_for_flow(self.flow_target)
+        """Set the argon MFC flow target via the DAC.
+
+        The MFC wants 0–5V for 0–MFC_FULL_SCALE sccm. The MCP4725 here is powered
+        off the Pi's 3.3V rail (no level shifter), so it can only physically put out
+        0–ARGON_DAC_VREF volts. We compute the voltage the MFC actually needs, then
+        clamp to what the DAC can deliver — until a level-shift/scaling circuit is
+        added, commanded flow above (ARGON_DAC_VREF / MFC_SETPOINT_VOLTAGE_FULL_SCALE)
+        * MFC_FULL_SCALE will be capped at that ceiling.
+        """
+        self.flow_target = max(0.0, min(float(sccm), MFC_FULL_SCALE))
+
+        if not self.dac_ready or self.i2c is None:
+            return
+
+        required_voltage = (self.flow_target / MFC_FULL_SCALE) * MFC_SETPOINT_VOLTAGE_FULL_SCALE
+        dac_voltage = min(required_voltage, ARGON_DAC_VREF)
+        code = int((dac_voltage / ARGON_DAC_VREF) * (ARGON_DAC_RESOLUTION - 1))
+        code = max(0, min(code, ARGON_DAC_RESOLUTION - 1))
+        self.dac_voltage = dac_voltage
+        self.dac_code = code
+        self._write_dac(code)
+
+    def _write_dac(self, code):
+        """Write a 12-bit value to the MCP4725 via fast-mode write (volatile, no EEPROM wear)."""
+        if self.i2c is None:
+            return
+
+        data = bytes([(code >> 8) & 0x0F, code & 0xFF])
+        i2c_locked = False
+        try:
+            i2c_locked = self.i2c.try_lock()
+            if i2c_locked:
+                self.i2c.writeto(self.dac_address, data)
+        except Exception:
+            pass
+        finally:
+            if i2c_locked:
+                try:
+                    self.i2c.unlock()
+                except Exception:
+                    pass
 
     def read(self):
         """Read sensor and return calculated flow. Returns a result dict."""
@@ -43,11 +99,16 @@ class MFCController:
         flow    = (voltage / ADC_VREF) * MFC_FULL_SCALE * MFC_GAS_CORRECTION_FACTOR
 
         return {
-            "adc":         adc,
-            "voltage":     voltage,
-            "flow":        flow,
+            "adc": adc,
+            "voltage": voltage,
+            "flow": flow,
             "valve_closed": self.valve_closed,
+            "dac_ready": self.dac_ready,
+            "flow_target": self.flow_target,
+            "dac_voltage": self.dac_voltage,
+            "dac_code": self.dac_code,
         }
+
 
     def valve_close(self):
         """

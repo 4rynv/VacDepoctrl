@@ -19,7 +19,8 @@ ADC_CHANNEL_MFC    = 1   # MFC flow on A1
 # ════════════════════════════════════════════════════════
 #  MFC CONTROLLER PARAMETERS
 # ════════════════════════════════════════════════════════
-MFC_FULL_SCALE = 500.0    # Full-scale output in sccm
+MFC_FULL_SCALE = 700.0    # Full-scale flow in sccm (MKS 1179A Ar: 0–5V setpoint = 0–700 sccm)
+MFC_SETPOINT_VOLTAGE_FULL_SCALE = 5.0  # Volts at the MFC's analog setpoint pin for full-scale flow
 MFC_GAS_CORRECTION_FACTOR = 1.39  # For Argon
 
 # ════════════════════════════════════════════════════════
@@ -39,7 +40,12 @@ PUMP_DOWN_COMPLETE_VOLTAGE  = 0.1     # Near-zero Pirani voltage before releasin
 ARGON_FLUSH_TARGET_VOLTAGE  = 1.19    # Pirani voltage target for argon flush (≈0.1 mbar)
 ARGON_FLUSH_FLOW_SETPOINT   = 150.0   # Placeholder MFC flow target during argon flush (sccm)
 SPUTTER_READY_TARGET_VOLTAGE = 0.466   # Pirani voltage target for sputter-ready range (≤0.466 V)
-ARGON_DAC_I2C_ADDRESS       = 0x60    # Placeholder DAC I2C address; to be configured when hardware known
+ARGON_DAC_I2C_ADDRESS       = 0x60    # I2C address for the argon MFC DAC (MCP4725 default)
+ARGON_DAC_VREF              = 3.3    # MCP4725's real max output — it's powered off the Pi's 3.3V rail
+                                      # (no level shifter fitted). This is NOT the MFC's 5V setpoint
+                                      # scale (see MFC_SETPOINT_VOLTAGE_FULL_SCALE) — it's the hard
+                                      # ceiling on what we can actually command out of the DAC today.
+ARGON_DAC_RESOLUTION        = 4096    # DAC resolution for MCP4725 / 12-bit output
 ADS1115_I2C_ADDRESS         = 0x48    # ADS1115 I2C address (default for most boards)
 
 # ════════════════════════════════════════════════════════
