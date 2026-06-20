@@ -292,3 +292,4 @@ If the chamber pressure oscillates around the target, reduce `PRESSURE_CONTROL_K
 - [ ] Pressure P+I loop if steady-state offset is observed
 - [ ] SPUTTERING state pressure maintenance
 - [ ] Datalog / CSV export of Pirani and MFC readings
+- [ ] State Machine is being updated
