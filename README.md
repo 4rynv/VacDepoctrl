@@ -172,32 +172,54 @@ The turbo pump interlock (GPIO 17) uses **transition-based** logic, not level-ba
 
 ## Installation
 
-### Dependencies
+### 1. Clone the Repository
+
+SSH into the Pi and clone the repo:
 
 ```bash
-pip install adafruit-blinka adafruit-circuitpython-ads1x15 RPi.GPIO --break-system-packages
+ssh raspberrypi@<pi-ip>
+git clone https://github.com/<your-username>/Sputter_ctrl.git ~/Sputter_ctrl
+cd ~/Sputter_ctrl
 ```
 
-### Enable I2C on the Pi
+### 2. Enable I2C on the Pi
 
 ```bash
 sudo raspi-config
 # Interface Options → I2C → Enable
+# Reboot when prompted
 ```
 
-Verify devices are visible:
+Verify both devices are visible on the I2C bus:
 
 ```bash
 i2cdetect -y 1
 # Should show 0x48 (ADS1115) and 0x60 (MCP4725)
 ```
 
-### Transfer Files
+### 3. Run the Setup Script
 
 ```bash
-scp -O main.py config.py mfc_control.py state_machine.py pirani.py graph.py \
-    raspberrypi@<pi-ip>:~/Sputter_ctrl/
+cd ~/Sputter_ctrl
+chmod +x setup.sh
+./setup.sh
 ```
+
+This script:
+- Installs system packages (`python3-pip`, `python3-venv`, `python3-full`)
+- Creates a virtual environment at `~/Sputter_ctrl/venv/`
+- Installs `adafruit-blinka`, `adafruit-circuitpython-ads1x15`, and `RPi.GPIO` into the venv
+- Adds a `source_sputt` alias to `~/.bashrc` for quick venv activation
+- Verifies all three packages import correctly
+
+After it completes:
+
+```bash
+source ~/.bashrc      # pick up the new alias
+source_sputt          # activate the venv
+```
+
+You only need to run `setup.sh` once. After that, just run `source_sputt` at the start of each session.
 
 ---
 
@@ -206,6 +228,7 @@ scp -O main.py config.py mfc_control.py state_machine.py pirani.py graph.py \
 Must be run on the Pi with a display connected (HDMI or VNC), not over a plain SSH session.
 
 ```bash
+source_sputt                  # activate venv (once per session)
 cd ~/Sputter_ctrl
 python3 main.py
 ```
@@ -214,7 +237,14 @@ To run over SSH with display forwarding:
 
 ```bash
 ssh -X raspberrypi@<pi-ip>
-cd ~/Sputter_ctrl && python3 main.py
+source_sputt && cd ~/Sputter_ctrl && python3 main.py
+```
+
+To pull the latest changes from the repo:
+
+```bash
+cd ~/Sputter_ctrl
+git pull
 ```
 
 ---
@@ -292,4 +322,3 @@ If the chamber pressure oscillates around the target, reduce `PRESSURE_CONTROL_K
 - [ ] Pressure P+I loop if steady-state offset is observed
 - [ ] SPUTTERING state pressure maintenance
 - [ ] Datalog / CSV export of Pirani and MFC readings
-- [ ] State Machine is being updated
