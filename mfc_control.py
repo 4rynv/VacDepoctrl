@@ -13,6 +13,9 @@ from config import (
     ARGON_DAC_VREF,
     ARGON_DAC_RESOLUTION,
     PRESSURE_CONTROL_KP,
+    PRESSURE_CONTROL_KD,
+    PRESSURE_CONTROL_KI,
+    PRESSURE_CONTROL_ICLAMP,
 )
 
 
@@ -36,6 +39,11 @@ class MFCController:
 
         self.dac_voltage = 0.0
         self.dac_code = 0
+
+        # PID controller state
+        self._prev_error = None
+        self._prev_time  = None
+        self._integral   = 0.0
         if self.i2c is not None:
             i2c_locked = False
             try:
@@ -130,7 +138,7 @@ class MFCController:
         """
         Force valve closed by pulling MFC valve close pin LOW.
         This is an emergency closure mechanism.
-        Also clears PD state to avoid derivative spike on re-arm.
+        Also clears PID state to avoid spikes on re-arm.
         """
         GPIO.setup(self.valve_close_pin, GPIO.OUT)
         GPIO.output(self.valve_close_pin, GPIO.LOW)
@@ -138,6 +146,8 @@ class MFCController:
         self.set_flow(0.0)
         self._prev_error = None
         self._prev_time  = None
+        self._integral   = 0.0
+        self._integral   = 0.0
 
     def valve_release(self):
         """
@@ -148,13 +158,35 @@ class MFCController:
         self.valve_closed = False
 
     def pressure_control_step(self, current_voltage, target_voltage):
-        """Proportional control step: nudge MFC flow to drive Pirani toward target_voltage.
+        """PID control step: nudge MFC flow to drive Pirani toward target_voltage.
 
-        Higher voltage = higher pressure. If current > target we are above the desired
-        pressure, so reduce flow. If current < target we are below, so increase flow.
+        Higher voltage = higher pressure.
+        error > 0 -> above target -> reduce flow
+        error < 0 -> below target -> increase flow
         Called once per poll tick from the polling thread.
         """
-        error = current_voltage - target_voltage   # positive → too much pressure
-        delta = PRESSURE_CONTROL_KP * error        # sccm to subtract
+        now   = time.time()
+        error = current_voltage - target_voltage
+
+        if self._prev_error is not None and self._prev_time is not None:
+            dt = now - self._prev_time
+            if dt > 0:
+                d_term = PRESSURE_CONTROL_KD * (error - self._prev_error) / dt
+                self._integral += error * dt
+                self._integral = max(
+                    -PRESSURE_CONTROL_ICLAMP / PRESSURE_CONTROL_KI,
+                    min(self._integral,
+                        PRESSURE_CONTROL_ICLAMP / PRESSURE_CONTROL_KI))
+            else:
+                d_term = 0.0
+        else:
+            d_term = 0.0
+
+        i_term = PRESSURE_CONTROL_KI * self._integral
+
+        self._prev_error = error
+        self._prev_time  = now
+
+        delta    = PRESSURE_CONTROL_KP * error + d_term + i_term
         new_flow = max(0.0, min(self.flow_target - delta, MFC_FULL_SCALE))
         self.set_flow(new_flow)

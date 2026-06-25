@@ -4,6 +4,7 @@ main.py — Sputter Vacuum Controller
 State machine + live scrolling graphs for Pirani voltage and MFC flow.
 """
 
+import math
 import socket
 import threading
 import time
@@ -55,8 +56,9 @@ _PIRANI_CAL = [
 _PIRANI_CAL_ADC = [(p, v * 0.33) for p, v in _PIRANI_CAL]
 
 def mbar_to_adc_voltage(mbar):
-    """Interpolate Pirani calibration table to get ADC voltage for a given pressure."""
-    # Table is sorted high-to-low pressure; find bracketing pair
+    """Interpolate Pirani calibration table using log-linear interpolation.
+    Interpolates linearly in log-pressure space to match the gauge physical response.
+    """
     cal = _PIRANI_CAL_ADC
     if mbar >= cal[0][0]:  return cal[0][1]
     if mbar <= cal[-1][0]: return cal[-1][1]
@@ -64,7 +66,8 @@ def mbar_to_adc_voltage(mbar):
         p_hi, v_hi = cal[i]
         p_lo, v_lo = cal[i+1]
         if p_lo <= mbar <= p_hi:
-            t = (mbar - p_lo) / (p_hi - p_lo)
+            if p_lo <= 0: p_lo = 1e-6
+            t = (math.log(mbar) - math.log(p_lo)) / (math.log(p_hi) - math.log(p_lo))
             return v_lo + t * (v_hi - v_lo)
     return cal[-1][1]
 
@@ -430,9 +433,11 @@ lbl_m_valve  = tk.Label(mff, text="Valve   : RELEASED",      font=("Courier", 14
 lbl_m_sputter_target  = tk.Label(mff, text="Sputter P (mbar):", font=("Courier", 12), anchor="w")
 entry_sputter_target  = tk.Entry(mff, width=10, font=("Courier", 12))
 btn_sputter_target    = tk.Button(mff, text="Set", font=("Courier", 10), command=lambda: _update_sputter_target())
+lbl_sputter_set_val   = tk.Label(mff, text="Set: 0.007 mbar", font=("Courier", 10), fg="black", anchor="w")
 lbl_m_argon  = tk.Label(mff, text="Argon PSI:",            font=("Courier", 12), anchor="w")
 entry_argon  = tk.Entry(mff, width=10, font=("Courier", 12))
 btn_argon    = tk.Button(mff, text="Update", font=("Courier", 10), command=lambda: _update_argon_pressure())
+lbl_argon_set_val     = tk.Label(mff, text="Set: 0.0 psi", font=("Courier", 10), fg="black", anchor="w")
 
 lbl_m_adc   .grid(row=0, sticky="w")
 lbl_m_volt  .grid(row=1, sticky="w")
@@ -443,12 +448,16 @@ lbl_m_valve .grid(row=4, sticky="w", pady=(6, 0))
 lbl_m_sputter_target.grid(row=5, column=0, sticky="w", pady=(6, 0))
 entry_sputter_target.grid(row=5, column=1, sticky="w", pady=(6, 0))
 btn_sputter_target.grid(row=5, column=2, padx=(6, 0), pady=(6, 0))
+lbl_sputter_set_val.grid(row=5, column=3, sticky="w", padx=(8, 0), pady=(6, 0))
+entry_sputter_target.bind("<Return>", lambda e: _update_sputter_target())
 lbl_m_argon.grid(row=6, column=0, sticky="w", pady=(6, 0))
 entry_argon.grid(row=6, column=1, sticky="w", pady=(6, 0))
 btn_argon.grid(row=6, column=2, padx=(6, 0), pady=(6, 0))
+lbl_argon_set_val.grid(row=6, column=3, sticky="w", padx=(8, 0), pady=(6, 0))
+entry_argon.bind("<Return>", lambda e: _update_argon_pressure())
 
 m_canvas = tk.Canvas(mff, height=90, bg="#1a1a1a", highlightthickness=0)
-m_canvas.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(6, 2))
+m_canvas.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(6, 2))
 mff.columnconfigure(0, weight=1)
 
 # Flow (solid, cyan, left-scale sccm) overlaid with DAC output voltage
@@ -514,6 +523,7 @@ def _update_sputter_target():
     with _lock:
         _state["sputter_target_mbar"] = v
         _state["error"] = ""
+    lbl_sputter_set_val.config(text=f"Set: {v:.4f} mbar")
 
 def _update_argon_pressure():
     raw_value = entry_argon.get().strip()
@@ -527,6 +537,7 @@ def _update_argon_pressure():
     with _lock:
         _state["argon_pressure"] = value
         _state["error"] = ""
+    lbl_argon_set_val.config(text=f"Set: {value:.1f} psi")
 
 
 def _ignite_plasma():
@@ -623,6 +634,9 @@ def _refresh():
 # ════════════════════════════════════════════════════════
 def _on_close():
     _stop_event.set()
+    time.sleep(0.5)  # Allow poll thread to exit cleanly
+    mfc.set_flow(0.0)
+    mfc.valve_close()
     pirani.shutdown()
     GPIO.cleanup()
     root.destroy()
