@@ -4,6 +4,7 @@ import threading
 from config import (
     VACUUM_THRESHOLD,  # Kept for config consistency, though currently unreferenced
     ATMOSPHERE_THRESHOLD,
+    VENTING_COMPLETE_VOLTAGE,
     IDLE_PRESSURE_MAX_VOLTAGE,
     PUMP_DOWN_COMPLETE_VOLTAGE,
     ARGON_FLUSH_TARGET_VOLTAGE,
@@ -112,14 +113,9 @@ class SputterStateMachine:
                     self._state = "SPUTTER_READY"
                     
             elif self._state == "VENTING":
-                # Check raw ADC values to reliably scale against atmospheric density
-                if pirani_adc is not None:
-                    if pirani_adc >= ATMOSPHERE_THRESHOLD:
-                        self._state = "IDLE"
-                else:
-                    # Fallback to legacy voltage structure if raw ADC counts aren't provided
-                    if pirani_voltage >= ATMOSPHERE_THRESHOLD:
-                        self._state = "IDLE"
+                # Transition to IDLE once Pirani reads atmospheric pressure
+                if pirani_voltage >= VENTING_COMPLETE_VOLTAGE:
+                    self._state = "IDLE"
 
             # If an automatic transition occurred, broadcast it to the hardware hook
             if old_state != self._state and self.on_transition_callback:

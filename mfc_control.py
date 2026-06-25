@@ -127,14 +127,17 @@ class MFCController:
 
 
     def valve_close(self):
-            """
-            Force valve closed by pulling MFC valve close pin LOW.
-            This is an emergency closure mechanism.
-            """
-            GPIO.setup(self.valve_close_pin, GPIO.OUT)
-            GPIO.output(self.valve_close_pin, GPIO.LOW)
-            self.valve_closed = True
-            self.set_flow(0.0)
+        """
+        Force valve closed by pulling MFC valve close pin LOW.
+        This is an emergency closure mechanism.
+        Also clears PD state to avoid derivative spike on re-arm.
+        """
+        GPIO.setup(self.valve_close_pin, GPIO.OUT)
+        GPIO.output(self.valve_close_pin, GPIO.LOW)
+        self.valve_closed = True
+        self.set_flow(0.0)
+        self._prev_error = None
+        self._prev_time  = None
 
     def valve_release(self):
         """

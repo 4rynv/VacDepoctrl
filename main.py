@@ -36,6 +36,38 @@ from config import (
     ADS1115_I2C_ADDRESS,
     ARGON_DAC_VREF,
 )
+# Pirani calibration table: (mbar, gauge_voltage) from datasheet
+# ADC voltage = gauge_voltage * 0.33 (resistor divider)
+_PIRANI_CAL = [
+    (999, 10.00), (850, 9.58), (800, 9.52), (700, 9.45), (600, 9.38),
+    (500, 9.28),  (400, 9.20), (300, 9.15), (200, 9.08), (100, 9.04),
+    (50,  8.85),  (25,  8.70), (20,  8.60), (15,  8.40), (10,  8.20),
+    (9,   8.10),  (8,   8.00), (7,   7.85), (6,   7.75), (5,   7.55),
+    (4,   7.28),  (3,   6.92), (2,   6.27), (1,   5.70), (0.9, 5.60),
+    (0.8, 5.51),  (0.7, 5.45), (0.6, 5.31), (0.5, 5.15), (0.4, 4.90),
+    (0.3, 4.52),  (0.2, 4.28), (0.1, 3.98), (0.09, 3.90),(0.08, 3.75),
+    (0.07, 3.64), (0.06, 3.55),(0.05, 3.44),(0.04, 3.23),(0.03, 2.93),
+    (0.02, 2.50), (0.01, 1.55),(0.009, 1.45),(0.008, 1.30),(0.007, 1.10),
+    (0.006, 0.95),(0.005, 0.80),(0.004, 0.65),(0.003, 0.50),(0.002, 0.35),
+    (0.001, 0.12),(0.0, 0.01),
+]
+# Pre-scale by divider ratio so table is in ADC volts
+_PIRANI_CAL_ADC = [(p, v * 0.33) for p, v in _PIRANI_CAL]
+
+def mbar_to_adc_voltage(mbar):
+    """Interpolate Pirani calibration table to get ADC voltage for a given pressure."""
+    # Table is sorted high-to-low pressure; find bracketing pair
+    cal = _PIRANI_CAL_ADC
+    if mbar >= cal[0][0]:  return cal[0][1]
+    if mbar <= cal[-1][0]: return cal[-1][1]
+    for i in range(len(cal) - 1):
+        p_hi, v_hi = cal[i]
+        p_lo, v_lo = cal[i+1]
+        if p_lo <= mbar <= p_hi:
+            t = (mbar - p_lo) / (p_hi - p_lo)
+            return v_lo + t * (v_hi - v_lo)
+    return cal[-1][1]
+
 from pirani        import PiraniController
 from mfc_control   import MFCController
 from state_machine import SputterStateMachine, STATE_COLORS
@@ -58,12 +90,9 @@ sm     = SputterStateMachine()
 def handle_hardware_interlocks(old_state, new_state):
     """Executes instantaneous safety overrides on the main thread when states shift."""
     if new_state in ["IDLE", "VENTING"]:
-        # Safety cutoff: Instantly kill gas flow and drop DAC to 0V
+        # Safety cutoff: kill gas flow, drop DAC to 0V, turn off opto
         mfc.set_flow(0.0)
         mfc.valve_close()
-
-    if new_state in ["IDLE", "VENTING"]:
-        # Turn off high vacuum opto-isolator signals safely
         pirani.set_opto(False)
 
     if new_state == "PUMP_DOWN":
@@ -106,7 +135,9 @@ _state = {
 
     "flow_target":     0.0,
     "argon_pressure":  0.0,
+    "sputter_target_mbar": 0.007,  # default 0.007 mbar
     "plasma_ignition_start": None,
+    "plasma_ignition_triggered": False,
     "sm_state":        "IDLE",
     "error":           "",
 }
@@ -154,6 +185,7 @@ def _on_confirm_plasma():
     if sm.transition("SPUTTER_READY"):
         with _lock:
             _state["plasma_ignition_start"] = None
+            _state["plasma_ignition_triggered"] = False
             _state["error"] = ""
     else:
         with _lock:
@@ -162,8 +194,10 @@ def _on_confirm_plasma():
 # ════════════════════════════════════════════════════════
 #  POLLING THREAD
 # ════════════════════════════════════════════════════════
+_stop_event = threading.Event()
+
 def _poll():
-    while True:
+    while not _stop_event.is_set():
         start_time = time.time()  # Track start time for precise loop interval timing
         try:
             current = sm.state
@@ -193,13 +227,16 @@ def _poll():
             elif current == "ARGON_FLUSH":
                 p = pirani.read(auto_opto=True)
                 mfc.valve_release()
-                # P-loop: raise flow until Pirani reaches target (0.09 mbar ≈ 1.20 V)
+                # PD-loop: raise flow until Pirani reaches target (0.09 mbar ≈ 1.20 V)
                 mfc.pressure_control_step(p["voltage"], ARGON_FLUSH_TARGET_VOLTAGE)
-                if p["voltage"] >= ARGON_FLUSH_TARGET_VOLTAGE:
+                with _lock:
+                    already_triggered = _state["plasma_ignition_triggered"]
+                if p["voltage"] >= ARGON_FLUSH_TARGET_VOLTAGE and not already_triggered:
                     _ignite_plasma()
                     if sm.transition("PLASMA_IGNITING"):
                         with _lock:
                             _state["plasma_ignition_start"] = time.time()
+                            _state["plasma_ignition_triggered"] = True
             elif current == "PLASMA_IGNITING":
                 p = pirani.read(auto_opto=True)
                 mfc.valve_release()
@@ -214,15 +251,23 @@ def _poll():
                     sm.transition("READY")
                     with _lock:
                         _state["plasma_ignition_start"] = None
+                        _state["plasma_ignition_triggered"] = False
                         _state["error"] = "Plasma ignition timed out; returned to READY."
             elif current == "SPUTTER_READY":
                 p = pirani.read(auto_opto=True)
                 mfc.valve_release()
-                # P-loop: maintain 0.07 mbar (1.201 V) while operator starts sputtering
-                mfc.pressure_control_step(p["voltage"], SPUTTER_READY_TARGET_VOLTAGE)
+                with _lock:
+                    sputter_target_mbar = _state["sputter_target_mbar"]
+                # Convert mbar to ADC voltage via calibration table
+                sputter_target_voltage = mbar_to_adc_voltage(sputter_target_mbar)
+                mfc.pressure_control_step(p["voltage"], sputter_target_voltage)
             elif current == "SPUTTERING":
                 p = pirani.read(auto_opto=True)
                 mfc.valve_release()
+                with _lock:
+                    sputter_target_mbar = _state["sputter_target_mbar"]
+                sputter_target_voltage = mbar_to_adc_voltage(sputter_target_mbar)
+                mfc.pressure_control_step(p["voltage"], sputter_target_voltage)
             elif current == "VENTING":
                 p = pirani.read(auto_opto=False)
                 mfc.set_flow(0.0)  # Ensure DAC is driven to 0V during venting operations
@@ -324,7 +369,7 @@ btn_stop = tk.Button(
     text="Stop Sputter",
     width=16,
     font=("Courier", 10),
-    command=lambda: sm.transition("READY")
+    command=lambda: sm.transition("VENTING")
 )
 
 btn_vent = tk.Button(
@@ -359,7 +404,7 @@ pf.grid(row=3, column=0, padx=12, pady=(6, 6), sticky="ew")
 lbl_p_adc      = tk.Label(pf, text="ADC     : ——",      font=("Courier", 12), anchor="w", width=32)
 lbl_p_volt     = tk.Label(pf, text="Voltage : ——.—— V", font=("Courier", 12), anchor="w", width=32)
 lbl_opto       = tk.Label(pf, text="OPTO    : ——",      font=("Courier", 14, "bold"), anchor="w", width=32)
-lbl_p_message  = tk.Label(pf, text="",               font=("Courier", 10), anchor="w", width=52, fg="blue")
+lbl_p_message  = tk.Label(pf, text="",               font=("Courier", 10), anchor="w", width=80, fg="blue")
 lbl_p_adc .grid(row=0, sticky="w")
 lbl_p_volt.grid(row=1, sticky="w")
 lbl_opto  .grid(row=2, sticky="w", pady=(6, 0))
@@ -382,6 +427,9 @@ lbl_m_volt   = tk.Label(mff, text="Voltage : ——.—— V",       font=("Cour
 lbl_m_flow   = tk.Label(mff, text="Flow    : ——.—— sccm Ar", font=("Courier", 14, "bold"), anchor="w", width=32)
 lbl_m_dac    = tk.Label(mff, text="DAC     : UNKNOWN",      font=("Courier", 12), anchor="w", width=32)
 lbl_m_valve  = tk.Label(mff, text="Valve   : RELEASED",      font=("Courier", 14, "bold"), anchor="w", width=32)
+lbl_m_sputter_target  = tk.Label(mff, text="Sputter P (mbar):", font=("Courier", 12), anchor="w")
+entry_sputter_target  = tk.Entry(mff, width=10, font=("Courier", 12))
+btn_sputter_target    = tk.Button(mff, text="Set", font=("Courier", 10), command=lambda: _update_sputter_target())
 lbl_m_argon  = tk.Label(mff, text="Argon PSI:",            font=("Courier", 12), anchor="w")
 entry_argon  = tk.Entry(mff, width=10, font=("Courier", 12))
 btn_argon    = tk.Button(mff, text="Update", font=("Courier", 10), command=lambda: _update_argon_pressure())
@@ -392,12 +440,15 @@ lbl_m_flow  .grid(row=2, sticky="w", pady=(6, 0))
 lbl_m_dac   .grid(row=3, sticky="w", pady=(6, 0))
 lbl_m_valve .grid(row=4, sticky="w", pady=(6, 0))
 
-lbl_m_argon.grid(row=5, column=0, sticky="w", pady=(6, 0))
-entry_argon.grid(row=5, column=1, sticky="w", pady=(6, 0))
-btn_argon.grid(row=5, column=2, padx=(6, 0), pady=(6, 0))
+lbl_m_sputter_target.grid(row=5, column=0, sticky="w", pady=(6, 0))
+entry_sputter_target.grid(row=5, column=1, sticky="w", pady=(6, 0))
+btn_sputter_target.grid(row=5, column=2, padx=(6, 0), pady=(6, 0))
+lbl_m_argon.grid(row=6, column=0, sticky="w", pady=(6, 0))
+entry_argon.grid(row=6, column=1, sticky="w", pady=(6, 0))
+btn_argon.grid(row=6, column=2, padx=(6, 0), pady=(6, 0))
 
 m_canvas = tk.Canvas(mff, height=90, bg="#1a1a1a", highlightthickness=0)
-m_canvas.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(6, 2))
+m_canvas.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(6, 2))
 mff.columnconfigure(0, weight=1)
 
 # Flow (solid, cyan, left-scale sccm) overlaid with DAC output voltage
@@ -447,6 +498,22 @@ BUTTON_STATES = {
 # ════════════════════════════════════════════════════════
 #  GUI REFRESH
 # ════════════════════════════════════════════════════════
+
+def _update_sputter_target():
+    raw = entry_sputter_target.get().strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        with _lock:
+            _state["error"] = "Invalid sputter target; enter pressure in mbar."
+        return
+    if v <= 0.0:
+        with _lock:
+            _state["error"] = "Sputter target must be > 0 mbar."
+        return
+    with _lock:
+        _state["sputter_target_mbar"] = v
+        _state["error"] = ""
 
 def _update_argon_pressure():
     raw_value = entry_argon.get().strip()
@@ -500,12 +567,10 @@ def _refresh():
     if st == "IDLE":
         p_message = "IDLE: MFC valve closed, turbo opto off."
     elif st == "PUMP_DOWN":
-        if s["pirani_voltage"] <= IDLE_PRESSURE_MAX_VOLTAGE and not s["opto_enabled"]:
-            p_message = "Pressure below 10 mbar. Turbo can now be started; turbo opto has been enabled."
-        elif s["pirani_voltage"] <= IDLE_PRESSURE_MAX_VOLTAGE and s["opto_enabled"]:
-            p_message = "Turbo opto is on; pressure should continue to drop toward zero."
+        if s["opto_enabled"]:
+            p_message = "Turbo opto ON at {:.4f} V; pump down continues.".format(s["pirani_voltage"])
         else:
-            p_message = "Pump down continues; wait until pressure falls below 10 mbar before turbo start."
+            p_message = "Pump down in progress; turbo opto will enable when pressure drops sufficiently."
     elif st == "READY":
         p_message = "READY: Start Argon Flush once inlet pressure is ≥ 15 psi."
     elif st == "ARGON_FLUSH":
@@ -557,6 +622,7 @@ def _refresh():
 #  CLEAN SHUTDOWN
 # ════════════════════════════════════════════════════════
 def _on_close():
+    _stop_event.set()
     pirani.shutdown()
     GPIO.cleanup()
     root.destroy()

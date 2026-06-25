@@ -34,15 +34,16 @@ TURBOOPTO_OFF_THRESHOLD = 15000   # ADC ≥ this: vacuum unsafe → turbo opto O
 #  STATE MACHINE THRESHOLDS
 # ════════════════════════════════════════════════════════
 VACUUM_THRESHOLD            = 10500   # ADC ≤ this → PUMP_DOWN to READY (legacy count-based threshold)
-ATMOSPHERE_THRESHOLD        = 30000   # ADC ≥ this → VENTING to IDLE
+ATMOSPHERE_THRESHOLD        = 30000   # ADC ≥ this → VENTING to IDLE (legacy)
+VENTING_COMPLETE_VOLTAGE    = 2.5     # Pirani voltage for atmosphere; VENTING to IDLE
 IDLE_PRESSURE_MAX_VOLTAGE   = 2.71    # Voltage threshold for safe pump-down start (10 mbar: 8.20V × 0.33)
-PUMP_DOWN_COMPLETE_VOLTAGE  = 0.051   # Pirani voltage for ~0.002 mbar (0.35V × 0.33); MFC valve safe to release
+PUMP_DOWN_COMPLETE_VOLTAGE  = 0.15   # Pirani voltage for ~0.01 mbar; threshold for PUMP_DOWN -> READY transition
 ARGON_FLUSH_TARGET_VOLTAGE  = 1.287   # Pirani voltage target for argon flush (0.09 mbar: 3.90V × 0.33)
 ARGON_FLUSH_FLOW_SETPOINT   = 150.0   # Initial MFC flow on flush entry; control loop takes over
 PRESSURE_CONTROL_KP         = 8.0    # Proportional gain for MFC pressure control loop (sccm/V-error)
 PRESSURE_CONTROL_KD         = 3.0     # Derivative gain for MFC pressure control loop (set >0 to dampen oscillation)
 PLASMA_IGNITION_TIMEOUT     = 120.0   # Seconds to wait for manual plasma confirmation before returning to READY
-SPUTTER_READY_TARGET_VOLTAGE = 0.363  # Pirani voltage target for sputtering (0.007 mbar: 1.10V × 0.33)
+SPUTTER_READY_TARGET_VOLTAGE = 0.6  # Pirani voltage target for sputtering (0.007 mbar: 1.10V × 0.33)
 ARGON_DAC_I2C_ADDRESS       = 0x60    # I2C address for the argon MFC DAC (MCP4725 default)
 ARGON_DAC_VREF              = 5.0     # MCP4725's real max output — it's powered off the Pi's 3.3V rail
                                       # (no level shifter fitted). This is NOT the MFC's 5V setpoint
