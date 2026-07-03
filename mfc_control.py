@@ -147,7 +147,6 @@ class MFCController:
         self._prev_error = None
         self._prev_time  = None
         self._integral   = 0.0
-        self._integral   = 0.0
 
     def valve_release(self):
         """
@@ -173,10 +172,12 @@ class MFCController:
             if dt > 0:
                 d_term = PRESSURE_CONTROL_KD * (error - self._prev_error) / dt
                 self._integral += error * dt
-                self._integral = max(
-                    -PRESSURE_CONTROL_ICLAMP / PRESSURE_CONTROL_KI,
-                    min(self._integral,
-                        PRESSURE_CONTROL_ICLAMP / PRESSURE_CONTROL_KI))
+                # Anti-windup: clamp so the I contribution never exceeds ICLAMP sccm.
+                # Guard against KI == 0 (e.g. while tuning) — no clamp needed then,
+                # since the I term is zero anyway.
+                if PRESSURE_CONTROL_KI > 0:
+                    limit = PRESSURE_CONTROL_ICLAMP / PRESSURE_CONTROL_KI
+                    self._integral = max(-limit, min(self._integral, limit))
             else:
                 d_term = 0.0
         else:

@@ -11,15 +11,15 @@ import time
 import tkinter as tk
 from tkinter import messagebox
 
-import board
-import busio
 import RPi.GPIO as GPIO
 import adafruit_ads1x15.ads1115 as ADS
+from adafruit_extended_bus import ExtendedI2C
 
 from config import (
     ADC_GAIN,
     POLLING_INTERVAL,
     GUI_REFRESH_INTERVAL,
+    ERROR_DISPLAY_SECONDS,
     GRAPH_MAX_SAMPLES,
     GRAPH_PIRANI_MIN,
     GRAPH_PIRANI_MAX,
@@ -36,6 +36,9 @@ from config import (
     PRESSURE_CONTROL_KP,
     ADS1115_I2C_ADDRESS,
     ARGON_DAC_VREF,
+    GPIO_TURBO_VALVE_PIN,
+    TURBO_VALVE_OPEN_MBAR,
+    I2C_BUS_NUMBER,
 )
 # Pirani calibration table: (mbar, gauge_voltage) from datasheet
 # ADC voltage = gauge_voltage * 0.33 (resistor divider)
@@ -71,6 +74,23 @@ def mbar_to_adc_voltage(mbar):
             return v_lo + t * (v_hi - v_lo)
     return cal[-1][1]
 
+def adc_voltage_to_mbar(voltage):
+    """Inverse of mbar_to_adc_voltage: ADC voltage -> pressure in mbar.
+    Interpolates linearly in voltage, logarithmically in pressure, matching
+    the Pirani gauge's log response (same DHPG-015 calibration table).
+    """
+    cal = _PIRANI_CAL_ADC
+    if voltage >= cal[0][1]:  return cal[0][0]   # >= 3.30 V: atmosphere (999)
+    if voltage <= cal[-1][1]: return cal[-1][0]  # <= 0.0033 V: over-range (0)
+    for i in range(len(cal) - 1):
+        p_hi, v_hi = cal[i]
+        p_lo, v_lo = cal[i+1]
+        if v_lo <= voltage <= v_hi:
+            if p_lo <= 0: p_lo = 1e-6
+            t = (voltage - v_lo) / (v_hi - v_lo)
+            return math.exp(math.log(p_lo) + t * (math.log(p_hi) - math.log(p_lo)))
+    return cal[-1][0]
+
 from pirani        import PiraniController
 from mfc_control   import MFCController
 from state_machine import SputterStateMachine, STATE_COLORS
@@ -82,7 +102,13 @@ from graph         import ScrollingGraph
 # ════════════════════════════════════════════════════════
 GPIO.setmode(GPIO.BCM)
 
-i2c = busio.I2C(board.SCL, board.SDA)
+# Turbo inlet valve (GPIO 4 -> BC547 -> relay, valve on NC contact):
+# LOW = relay released = NC shorted = valve CLOSED. Held closed from startup;
+# driven HIGH (valve open) only above TURBO_VALVE_OPEN_MBAR during VENTING (see _poll).
+GPIO.setup(GPIO_TURBO_VALVE_PIN, GPIO.OUT)
+GPIO.output(GPIO_TURBO_VALVE_PIN, GPIO.LOW)
+
+i2c = ExtendedI2C(I2C_BUS_NUMBER)
 ads = ADS.ADS1115(i2c, address=ADS1115_I2C_ADDRESS)
 ads.gain = ADC_GAIN
 
@@ -97,6 +123,12 @@ def handle_hardware_interlocks(old_state, new_state):
         mfc.set_flow(0.0)
         mfc.valve_close()
         pirani.set_opto(False)
+        # Reset plasma ignition tracking so the next flush cycle starts clean —
+        # a stale triggered flag would block _poll from re-arming the ignition
+        # timeout on the next ARGON_FLUSH cycle.
+        with _lock:
+            _state["plasma_ignition_start"] = None
+            _state["plasma_ignition_triggered"] = False
 
     if new_state == "PUMP_DOWN":
         # Reset opto so it can re-trigger at 1.2 V on the next pump-down cycle
@@ -137,6 +169,7 @@ _state = {
     "dac_code":        0,
 
     "flow_target":     0.0,
+    "turbo_valve_open": False,
     "argon_pressure":  0.0,
     "sputter_target_mbar": 0.007,  # default 0.007 mbar
     "plasma_ignition_start": None,
@@ -200,6 +233,7 @@ def _on_confirm_plasma():
 _stop_event = threading.Event()
 
 def _poll():
+    turbo_valve_open = False  # GPIO 4 driven LOW (valve closed) during hardware init
     while not _stop_event.is_set():
         start_time = time.time()  # Track start time for precise loop interval timing
         try:
@@ -214,8 +248,8 @@ def _poll():
                     sm.transition("PUMP_DOWN", pirani_voltage=p["voltage"])
             elif current == "PUMP_DOWN":
                 p = pirani.read(auto_opto=False)
-                # Transition-based opto: fire HIGH only when voltage first drops below 1.2 V
-                if not p["opto_enabled"] and p["voltage"] <= 1.2:
+                # Transition-based opto: fire HIGH only when voltage first drops below 1.3 V
+                if not p["opto_enabled"] and p["voltage"] <= 1.3:
                     pirani.set_opto(True)
                     p["opto_enabled"] = True
                 mfc.set_flow(0.0)
@@ -274,14 +308,27 @@ def _poll():
             elif current == "VENTING":
                 p = pirani.read(auto_opto=False)
                 mfc.set_flow(0.0)  # Ensure DAC is driven to 0V during venting operations
-                mfc.valve_release()
+                mfc.valve_close()  # Keep MFC valve closed throughout venting
                 pirani.set_opto(False)
             else:
                 p = pirani.read(auto_opto=True)
                 mfc.valve_release()
 
+            # Turbo inlet valve (GPIO 4): held CLOSED (LOW) at all times, except
+            # latched OPEN (HIGH) once pressure rises above TURBO_VALVE_OPEN_MBAR
+            # while VENTING. Latching (rather than level-comparing every tick)
+            # prevents relay chatter from ADC noise around the threshold.
+            # Re-closed automatically on leaving VENTING.
+            if current == "VENTING":
+                if not turbo_valve_open and adc_voltage_to_mbar(p["voltage"]) > TURBO_VALVE_OPEN_MBAR:
+                    GPIO.output(GPIO_TURBO_VALVE_PIN, GPIO.HIGH)
+                    turbo_valve_open = True
+            elif turbo_valve_open:
+                GPIO.output(GPIO_TURBO_VALVE_PIN, GPIO.LOW)
+                turbo_valve_open = False
+
             m = mfc.read()
-            
+
             # Pass the raw ADC counts into the state machine to satisfy the atmosphere transition rule
             sm.update(p["voltage"], pirani_adc=p["adc"], opto_enabled=p["opto_enabled"])
 
@@ -298,9 +345,18 @@ def _poll():
                     "dac_voltage":      m.get("dac_voltage", 0.0),
                     "dac_code":         m.get("dac_code", 0),
                     "flow_target":      m.get("flow_target", 0.0),
+                    "turbo_valve_open": turbo_valve_open,
                     "sm_state":         sm.state,
-                    "error":            "",
                 })
+
+            # Re-assert the safety cutoff if an E-STOP / vent transition landed
+            # mid-tick: the branch above read `current` before the transition and
+            # may have called valve_release()/set_flow() *after* the interlock
+            # callback already cut everything off. Last write must be the cutoff.
+            if sm.state in ("IDLE", "VENTING") and current not in ("IDLE", "VENTING"):
+                mfc.set_flow(0.0)
+                mfc.valve_close()
+                pirani.set_opto(False)
 
         except Exception as e:
             # Prevents background thread termination if an I2C transaction glitches
@@ -314,7 +370,8 @@ def _poll():
         time.sleep(sleep_time)
 
 
-threading.Thread(target=_poll, daemon=True).start()
+_poll_thread = threading.Thread(target=_poll, daemon=True)
+_poll_thread.start()
 
 
 # ════════════════════════════════════════════════════════
@@ -406,15 +463,19 @@ pf.grid(row=3, column=0, padx=12, pady=(6, 6), sticky="ew")
 
 lbl_p_adc      = tk.Label(pf, text="ADC     : ——",      font=("Courier", 12), anchor="w", width=32)
 lbl_p_volt     = tk.Label(pf, text="Voltage : ——.—— V", font=("Courier", 12), anchor="w", width=32)
+lbl_p_mbar     = tk.Label(pf, text="Pressure: ——.—— mbar", font=("Courier", 12, "bold"), anchor="w", width=32)
 lbl_opto       = tk.Label(pf, text="OPTO    : ——",      font=("Courier", 14, "bold"), anchor="w", width=32)
+lbl_tvalve     = tk.Label(pf, text="T-VALVE : ——",      font=("Courier", 14, "bold"), anchor="w", width=32)
 lbl_p_message  = tk.Label(pf, text="",               font=("Courier", 10), anchor="w", width=80, fg="blue")
 lbl_p_adc .grid(row=0, sticky="w")
 lbl_p_volt.grid(row=1, sticky="w")
-lbl_opto  .grid(row=2, sticky="w", pady=(6, 0))
-lbl_p_message.grid(row=3, sticky="w", pady=(6, 0))
+lbl_p_mbar.grid(row=2, sticky="w")
+lbl_opto  .grid(row=3, sticky="w", pady=(6, 0))
+lbl_tvalve.grid(row=4, sticky="w")
+lbl_p_message.grid(row=5, sticky="w", pady=(6, 0))
 
 p_canvas = tk.Canvas(pf, height=90, bg="#1a1a1a", highlightthickness=0)
-p_canvas.grid(row=4, column=0, sticky="ew", pady=(6, 2))
+p_canvas.grid(row=6, column=0, sticky="ew", pady=(6, 2))
 pf.columnconfigure(0, weight=1)
 
 p_graph = ScrollingGraph(p_canvas, maxlen=GRAPH_MAX_SAMPLES,
@@ -550,6 +611,10 @@ def _ignite_plasma():
     pass
 
 
+# Tracks the currently displayed error and when it first appeared (GUI thread only)
+_error_display = {"text": "", "since": 0.0}
+
+
 def _refresh():
     with _lock:
         s = dict(_state)
@@ -570,9 +635,18 @@ def _refresh():
     # — Pirani —
     lbl_p_adc .config(text=f"ADC     : {s['pirani_adc']}")
     lbl_p_volt.config(text=f"Voltage : {s['pirani_voltage']:.6f} V")
+    mbar = adc_voltage_to_mbar(s["pirani_voltage"])
+    if mbar >= 999:
+        lbl_p_mbar.config(text="Pressure: ATM (>999 mbar)")
+    else:
+        lbl_p_mbar.config(text=f"Pressure: {mbar:.3g} mbar")
     lbl_opto  .config(
         text = "OPTO    : ON " if s["opto_enabled"] else "OPTO    : OFF",
         fg   = "green"         if s["opto_enabled"] else "red",
+    )
+    lbl_tvalve.config(
+        text = "T-VALVE : OPEN (venting)" if s["turbo_valve_open"] else "T-VALVE : CLOSED",
+        fg   = "orange"                   if s["turbo_valve_open"] else "green",
     )
 
     if st == "IDLE":
@@ -621,6 +695,23 @@ def _refresh():
     m_graph.draw()
 
     # — Status —
+    # Errors are no longer wiped by the polling thread; expire them here after
+    # ERROR_DISPLAY_SECONDS so the operator has time to read them but a single
+    # transient glitch doesn't leave the status bar red forever.
+    if s["error"]:
+        now = time.time()
+        if s["error"] != _error_display["text"]:
+            _error_display["text"]  = s["error"]
+            _error_display["since"] = now
+        elif now - _error_display["since"] >= ERROR_DISPLAY_SECONDS:
+            with _lock:
+                if _state["error"] == s["error"]:
+                    _state["error"] = ""
+            s["error"] = ""
+            _error_display["text"] = ""
+    else:
+        _error_display["text"] = ""
+
     lbl_status.config(
         text = f"ERR: {s['error']}" if s["error"] else "OK",
         fg   = "red"                if s["error"] else "grey",
@@ -634,7 +725,7 @@ def _refresh():
 # ════════════════════════════════════════════════════════
 def _on_close():
     _stop_event.set()
-    time.sleep(0.5)  # Allow poll thread to exit cleanly
+    _poll_thread.join(timeout=2.0)  # Wait for poll thread to exit cleanly
     mfc.set_flow(0.0)
     mfc.valve_close()
     pirani.shutdown()

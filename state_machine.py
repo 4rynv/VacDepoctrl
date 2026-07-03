@@ -2,13 +2,9 @@
 
 import threading
 from config import (
-    VACUUM_THRESHOLD,  # Kept for config consistency, though currently unreferenced
-    ATMOSPHERE_THRESHOLD,
     VENTING_COMPLETE_VOLTAGE,
     IDLE_PRESSURE_MAX_VOLTAGE,
     PUMP_DOWN_COMPLETE_VOLTAGE,
-    ARGON_FLUSH_TARGET_VOLTAGE,
-    SPUTTER_READY_TARGET_VOLTAGE,
 )
 
 # ── Valid manual transitions ──────────────────────────
@@ -87,7 +83,11 @@ class SputterStateMachine:
     def update(self, pirani_voltage, pirani_adc=None, opto_enabled=False):
         """
         Automatic sensor-driven transitions. Evaluated continuously by the hardware polling thread.
-        Corrects units-mismatch bug in VENTING state by matching ADC-counts against ATMOSPHERE_THRESHOLD.
+
+        Note: ARGON_FLUSH -> PLASMA_IGNITING is owned exclusively by _poll() in
+        main.py (it arms the ignition timeout and fires _ignite_plasma()), and
+        PLASMA_IGNITING -> SPUTTER_READY is operator-only via Confirm Plasma —
+        neither transition may be duplicated here.
         """
         with self._lock:
             old_state = self._state
@@ -103,15 +103,7 @@ class SputterStateMachine:
                 if pirani_voltage >= IDLE_PRESSURE_MAX_VOLTAGE:
                     # Pressure degraded (e.g. leak); drop back into pump-down
                     self._state = "PUMP_DOWN"
-                    
-            elif self._state == "ARGON_FLUSH":
-                if pirani_voltage >= ARGON_FLUSH_TARGET_VOLTAGE:
-                    self._state = "PLASMA_IGNITING"
-                    
-            elif self._state == "PLASMA_IGNITING":
-                if pirani_voltage <= SPUTTER_READY_TARGET_VOLTAGE:
-                    self._state = "SPUTTER_READY"
-                    
+
             elif self._state == "VENTING":
                 # Transition to IDLE once Pirani reads atmospheric pressure
                 if pirani_voltage >= VENTING_COMPLETE_VOLTAGE:

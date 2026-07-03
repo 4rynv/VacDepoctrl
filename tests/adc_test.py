@@ -1,20 +1,17 @@
 
 import time
-import board
-import busio
 
 import adafruit_ads1x15.ads1115 as ADS
 
 from adafruit_ads1x15.analog_in import AnalogIn
+from adafruit_extended_bus import ExtendedI2C
 
 # -----------------------------------
 # Initialize I2C
+# bus 3 = software i2c-gpio: SDA=GPIO23 (pin 16), SCL=GPIO24 (pin 18)
 # -----------------------------------
 
-i2c = busio.I2C(
-            board.SCL,
-                board.SDA
-                )
+i2c = ExtendedI2C(3)
 
 # -----------------------------------
 # Initialize ADS1115

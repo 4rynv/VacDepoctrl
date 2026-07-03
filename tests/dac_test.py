@@ -1,6 +1,5 @@
 import time
-import board
-import busio
+from adafruit_extended_bus import ExtendedI2C
 
 # --------------------------------------------------
 #  Test MCP4725 / I2C DAC output on 0-3.3V range
@@ -59,7 +58,8 @@ def wait_dac_ready(i2c, timeout=2.0):
     return False, buf
 
 
-with busio.I2C(board.SCL, board.SDA) as i2c:
+# bus 3 = software i2c-gpio: SDA=GPIO23 (pin 16), SCL=GPIO24 (pin 18)
+with ExtendedI2C(3) as i2c:
     print("Scanning I2C bus...")
     while not i2c.try_lock():
         pass

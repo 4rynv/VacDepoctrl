@@ -5,6 +5,23 @@
 # ════════════════════════════════════════════════════════
 GPIO_PIRANI_PIN           = 17   # Input from Pirani gauge / control line for opto logic
 GPIO_MFC_VALVE_CLOSE_PIN  = 27   # MFC valve close (emergency shut)
+GPIO_TURBO_VALVE_PIN      = 22   # Turbo inlet valve relay (BC547 driver, valve on NC
+                                 # contact): GPIO HIGH = valve OPEN, LOW = valve CLOSED.
+                                 # Held closed at all times; opened only above
+                                 # TURBO_VALVE_OPEN_MBAR during VENTING.
+                                 # (Was GPIO 4 / physical pin 7 — pad affected in the
+                                 # early hardware issue along with GPIO 2/3. GPIO 22
+                                 # = physical pin 15.)
+TURBO_VALVE_OPEN_MBAR     = 0.01 # During VENTING, open the turbo inlet valve once
+                                 # chamber pressure rises above this (latched until
+                                 # the state machine leaves VENTING)
+
+# ════════════════════════════════════════════════════════
+#  I2C BUS
+# ════════════════════════════════════════════════════════
+I2C_BUS_NUMBER = 3   # 1 = hardware I2C (GPIO2/3, physical pins 3/5) — configured
+                     # by early hardware issue. 3 = software i2c-gpio on GPIO23/24
+                     # (physical pins 16/18), enabled via dtoverlay in /boot/firmware/config.txt
 
 # ════════════════════════════════════════════════════════
 #  ADC CONFIGURATION
@@ -37,7 +54,7 @@ VACUUM_THRESHOLD            = 10500   # ADC ≤ this → PUMP_DOWN to READY (leg
 ATMOSPHERE_THRESHOLD        = 30000   # ADC ≥ this → VENTING to IDLE (legacy)
 VENTING_COMPLETE_VOLTAGE    = 2.5     # Pirani voltage for atmosphere; VENTING to IDLE
 IDLE_PRESSURE_MAX_VOLTAGE   = 2.71    # Voltage threshold for safe pump-down start (10 mbar: 8.20V × 0.33)
-PUMP_DOWN_COMPLETE_VOLTAGE  = 0.15   # Pirani voltage for ~0.01 mbar; threshold for PUMP_DOWN -> READY transition
+PUMP_DOWN_COMPLETE_VOLTAGE  = 0.2   # Pirani voltage for ~0.01 mbar; threshold for PUMP_DOWN -> READY transition
 ARGON_FLUSH_TARGET_VOLTAGE  = 1.287   # Pirani voltage target for argon flush (0.09 mbar: 3.90V × 0.33)
 ARGON_FLUSH_FLOW_SETPOINT   = 150.0   # Initial MFC flow on flush entry; control loop takes over
 PRESSURE_CONTROL_KP         = 8.0    # Proportional gain for MFC pressure control loop (sccm/V-error)
@@ -78,3 +95,4 @@ GRAPH_MFC_COLOR = "cyan"
 #  GUI REFRESH INTERVAL
 # ════════════════════════════════════════════════════════
 GUI_REFRESH_INTERVAL = 200  # milliseconds
+ERROR_DISPLAY_SECONDS = 10  # How long an error message stays in the status bar before auto-clearing
