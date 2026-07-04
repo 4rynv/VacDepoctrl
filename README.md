@@ -7,6 +7,7 @@ A Raspberry Pi-based vacuum process controller for DC magnetron sputter depositi
 ## Table of Contents
 
 - [Hardware Overview](#hardware-overview)
+- [Hardware Notes (Hardware Notes)](#hardware-notes)
 - [Software Architecture](#software-architecture)
 - [File Structure](#file-structure)
 - [State Machine](#state-machine)
@@ -16,7 +17,7 @@ A Raspberry Pi-based vacuum process controller for DC magnetron sputter depositi
 - [Configuration](#configuration)
 - [GUI Guide](#gui-guide)
 - [Known Limitations](#known-limitations)
-- [Pending Features](#pending-features)
+- [Roadmap](#roadmap)
 
 ---
 
@@ -26,17 +27,34 @@ A Raspberry Pi-based vacuum process controller for DC magnetron sputter depositi
 |---|---|---|---|
 | Microcontroller | Raspberry Pi 2B (BCM GPIO) | — | Host for all control logic |
 | Pirani gauge | ACE Instruments DHPG-015 | Analog 0–10V | Divided to 0–3.3V before ADC (ratio 0.33) |
-| ADC | ADS1115 | I2C @ 0x48 | Pirani on A0, MFC feedback on A1 |
+| ADC | ADS1115 | **I2C bus 3** @ 0x48 | Pirani on A0, MFC feedback on A1 |
 | MFC | MKS 1179A | Analog 0–5V setpoint | 0–700 sccm Argon |
-| DAC | MCP4725 | I2C @ 0x60 | Powered off Pi 3.3V rail — buffered, see below |
+| DAC | MCP4725 | **I2C bus 3** @ 0x60 | Powered off Pi 3.3V rail — buffered, see below |
 | DAC buffer | LM358P op-amp | Analog | Unity-gain follower; required, DAC alone cannot drive MFC setpoint input |
-| Turbo interlock | Opto-isolator (4N35) | GPIO 17 (BCM) | Drives turbo pump enable signal |
-| MFC valve close | Emergency shut | GPIO 27 (BCM) | Pulls MFC valve closed on demand |
-| Turbo inlet valve opto | Opto-isolator (4N35) | GPIO 4 (BCM) | HIGH = valve closed, LOW = valve open |
+| Turbo enable | Opto-isolator (4N35) | GPIO 17 (BCM, phys 11) | Marginal — needs BC547 output buffer, see below |
+| MFC valve close | Emergency shut | GPIO 27 (BCM, phys 13) | Pulls MFC valve closed on demand |
+| Turbo inlet valve | Relay via BC547 | **GPIO 22 (BCM, phys 15)** | HIGH = valve OPEN, LOW = valve CLOSED (relay NC contact) |
+
+### I2C: Software Bus 3 on GPIO 23/24
+
+The Pi's hardware I2C pads (GPIO 2/3, physical pins 3/5) were affected in the early hardware issue (see below). I2C now runs as a **bit-banged software bus** via device-tree overlay in `/boot/firmware/config.txt`:
+
+```
+dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=24,i2c_gpio_delay_us=2
+```
+
+| Signal | BCM | Physical pin |
+|---|---|---|
+| SDA | GPIO 23 | 16 |
+| SCL | GPIO 24 | 18 |
+
+The code opens the bus with `ExtendedI2C(I2C_BUS_NUMBER)` from `adafruit-extended-bus` (bus number set in `config.py`; switch back to `1` if hardware I2C is ever restored). **Note:** unlike pins 3/5, GPIO 23/24 have no on-board pull-ups — the breakout boards' 10 kΩ pull-ups are what keeps the bus alive. Bare chips would need external 4.7 kΩ pull-ups to 3.3 V.
+
+Software bus speed is slower than hardware I2C; irrelevant at the 0.2 s polling rate. A harmless "I2C frequency is not settable in python" warning is printed at startup.
 
 ### Voltage Divider (Pirani Output)
 
-The DHPG-015 outputs 0–10V. A 3-resistor voltage divider scales this to 0–3.3V for the ADS1115 (divider ratio 0.33). All pressure thresholds in `config.py` are expressed in post-divider (ADC-side) volts.
+The DHPG-015 outputs 0–10V. A 3-resistor voltage divider scales this to 0–3.3V for the ADS1115 (divider ratio 0.33). All pressure thresholds in `config.py` are expressed in post-divider (ADC-side) volts. The full manufacturer calibration table lives in `Docs/Di-Hi-Pr-Pirani output voltage.pdf` and is transcribed as `_PIRANI_CAL` in `main.py`.
 
 ### DAC Output Buffer (LM358P)
 
@@ -50,22 +68,53 @@ LM358 VCC (pin 8) ── Pi 5V
 LM358 GND (pin 4) ── GND
 ```
 
-Power the op-amp from the Pi's **5V** rail, not 3.3V — at 3.3V supply the LM358's output headroom (~1.5V below V+) caps it at ~1.8V, which doesn't improve on the unbuffered DAC ceiling. At 5V supply the usable output range comfortably covers the full 0–3.3V DAC range.
+Power the op-amp from the Pi's **5V** rail, not 3.3V — at 3.3V supply the LM358's output headroom (~1.5V below V+) caps it at ~1.8V. At 5V supply the usable output range covers the full 0–3.3V DAC range. The buffer increases available *current*, not voltage.
 
-`ARGON_DAC_VREF` in `config.py` is set to `3.3` (not 5.0) since this is the real ceiling of the MCP4725's own output stage — the buffer doesn't increase available *voltage*, only current.
+### Turbo Inlet Valve (GPIO 22 → BC547 → Relay → Solenoid)
 
-### Turbo Inlet Valve Interlock (GPIO 4)
+The turbo inlet solenoid valve (~50 mA @ 25–26 V) is switched by a relay, driven by a BC547:
 
-A second opto-isolator gates the turbo pump inlet valve, independent of the turbo enable opto (GPIO 17):
+```
+GPIO22 ──470Ω── base   BC547   collector ── relay coil ── +5V
+                          emitter ── GND         ▲
+                                          1N4007 across coil
+                                          (band toward +5V)
 
-- Valve is **open** when the opto is **off**, **closed** when the opto is **on**
-- Closed any time the turbo motor is running
-- Currently gated on chamber pressure (no turbo RPM readout wired up yet): valve opens automatically once pressure rises above **0.1 mbar**
-- A proper RPM-based interlock (EXC120 analogue speed output, pins 16/17) is on the pending list — see [Pending Features](#pending-features)
+Valve circuit ── relay COM + NC contacts (isolated from the Pi)
+```
 
-### Known Opto Failure Mode
+- Valve is wired through the relay's **NC (normally closed)** contact: relay released = valve circuit shorted = **valve CLOSED**; relay energized = **valve OPEN**.
+- Logic (in `_poll()`): valve held CLOSED at all times; **latched OPEN** the first time pressure rises above `TURBO_VALVE_OPEN_MBAR` (0.01 mbar) during **VENTING**; re-closed automatically on leaving VENTING. Latching prevents relay chatter from ADC noise around the threshold.
+- Fail-safe: if the Pi crashes or loses power, the relay releases and the valve **fails closed** — the safe direction for the turbo inlet.
+- GUI shows live actuation state (`T-VALVE : CLOSED` / `OPEN (venting)`).
 
-Two 4N35 opto-isolators failed during testing on the turbo enable line (GPIO 17). Root cause suspected to be inductive kickback from the turbo controller's input circuit on switch-off, exceeding the phototransistor's collector-emitter rating transiently. **Mitigation not yet installed**: a 1N4148 (or 1N4001) flyback diode across the opto's collector-emitter, plus a pulldown resistor, is recommended before further testing. See [Known Limitations](#known-limitations).
+Do **not** drive relay coils or solenoids from a 4N35 directly — see the hard-won rule below.
+
+### Opto/Load Rule of Thumb (learned the expensive way)
+
+A 4N35's usable output current is roughly `CTR (~100%) × LED current (~10 mA max from a GPIO)` ≈ **10 mA**. Asked for more, it goes linear and drops the supply across itself (looks like a mystery series resistor). Loads measured on this rig:
+
+| Load | Draw | 4N35 alone? |
+|---|---|---|
+| Turbo enable input | ~15–30 mA | **No** — needs BC547 buffer (pending) |
+| Relay coil (5V) | ~60 mA | No — driven by BC547 directly, opto not needed (relay contacts provide the isolation) |
+| Inlet solenoid | ~50 mA @ 26V | No — relay contacts switch it |
+
+The turbo enable opto (GPIO 17) currently only works with excess LED drive; the proper fix is a BC547 buffer on its output (opto pin 5 → enable+, pin 4 → BC547 base, 10 kΩ base–emitter, BC547 C/E across the enable terminals). Flyback diodes go **in parallel across coils** (reverse-biased), never in series.
+
+---
+
+## Hardware Notes (Hardware Notes)
+
+During valve wiring, the 26 V solenoid supply contacted the logic wiring around header pins 3–7. Notes — **do not use these pins**:
+
+| Pin | BCM | Was | Status |
+|---|---|---|---|
+| phys 3 | GPIO 2 (SDA) | hardware I2C | **not used — bypassed by software bus 3 |
+| phys 5 | GPIO 3 (SCL) | hardware I2C | **not used — bypassed by software bus 3 |
+| phys 7 | GPIO 4 | turbo inlet valve | **not used — moved to GPIO 22 |
+
+The original ADS1115 were affected during same event (replaced); the MCP4725 survived. Notes: 26 V wiring physically segregated from the logic breadboard (only relay contacts bridge the domains); series resistors into ADC inputs recommended (pending).
 
 ---
 
@@ -73,25 +122,32 @@ Two 4N35 opto-isolators failed during testing on the turbo enable line (GPIO 17)
 
 ```
 main.py
-├── Hardware init (GPIO, I2C, ADS1115)
+├── Hardware init (GPIO, ExtendedI2C bus 3, ADS1115)
 ├── Shared state dict (thread-safe, _lock)
 ├── Polling thread (_poll) — runs every POLLING_INTERVAL (0.2s)
 │   ├── Reads Pirani + MFC sensors
 │   ├── Drives MFC pressure PID loop
+│   ├── Drives turbo inlet valve latch (GPIO 22)
 │   ├── Calls sm.update() for auto-transitions
 │   ├── Converts Pirani voltage <-> mbar via log-linear calibration table
+│   ├── End-of-tick safety cutoff re-assert (E-STOP race guard)
 │   └── Updates shared state dict
 ├── Tkinter GUI (main thread)
 │   ├── _refresh() — runs every GUI_REFRESH_INTERVAL (200ms) via root.after()
 │   ├── Scrolling graphs (ScrollingGraph)
-│   ├── Manual set-point entry fields (sputter target mbar, argon PSI) with Enter-to-submit
-│   ├── Live IP address display
+│   ├── Live pressure readout in mbar (adc_voltage_to_mbar)
+│   ├── Manual set-point entry fields (sputter target mbar, argon PSI)
+│   ├── Error display with ERROR_DISPLAY_SECONDS auto-expiry
 │   └── Button callbacks → sm.transition()
 └── Hardware interlock callback
     └── handle_hardware_interlocks() — fires on every state transition
 ```
 
-The polling thread and GUI thread never share objects directly — all data passes through `_state` dict protected by `_lock`. On window close, `_stop_event` signals the polling thread to exit before `GPIO.cleanup()` runs, avoiding a race that previously caused `[HW ERROR] Polling loop glitch` on shutdown.
+The polling thread and GUI thread never share objects directly — all data passes through `_state` dict protected by `_lock`. On window close, `_stop_event` is set and the polling thread is **joined** (2 s timeout) before hardware shutdown and `GPIO.cleanup()`.
+
+**E-STOP race guard:** the poll loop reads the state once per tick; if an E-STOP/vent transition lands mid-tick, the interlock callback's cutoff could be overwritten by in-flight `valve_release()`/`set_flow()` calls. The poll loop therefore re-asserts the full safety cutoff at the end of any tick in which the state machine moved to IDLE/VENTING — the cutoff is always the last hardware write of the tick.
+
+**Error handling:** errors are no longer cleared by the polling loop each tick. They persist in the status bar for `ERROR_DISPLAY_SECONDS` (10 s) and then auto-expire, so both operator-guard messages and the plasma-timeout message are actually readable.
 
 ---
 
@@ -99,13 +155,19 @@ The polling thread and GUI thread never share objects directly — all data pass
 
 ```
 Sputter_ctrl/
-├── main.py           — Entry point: GUI, polling thread, hardware init
-├── config.py         — All constants, thresholds, and pin assignments
-├── state_machine.py  — SputterStateMachine class
-├── mfc_control.py    — MFCController class (DAC, valve, PID loop)
-├── pirani.py         — PiraniController class (ADC, opto)
-├── graph.py          — ScrollingGraph class (pure Tkinter, no matplotlib)
-└── README.md
+├── main.py            — Entry point: GUI, polling thread, hardware init, cal table
+├── config.py          — All constants, thresholds, and pin assignments
+├── state_machine.py   — SputterStateMachine class
+├── mfc_control.py     — MFCController class (DAC, valve, PID loop)
+├── pirani.py          — PiraniController class (ADC, turbo enable opto)
+├── graph.py           — ScrollingGraph class (pure Tkinter, no matplotlib)
+├── setup.sh           — venv + dependency installer
+├── Docs/              — Pirani calibration datasheet PDF
+└── tests/
+    ├── adc_test.py         — ADS1115 read loop (bus 3)
+    ├── dac_test.py         — MCP4725 sweep + readback (bus 3)
+    ├── opto_test.py        — GPIO 17 turbo enable opto toggle
+    └── turbo_valve_test.py — GPIO 22 relay/valve toggle
 ```
 
 ---
@@ -149,21 +211,19 @@ Sputter_ctrl/
          Any state ──[E-STOP]──► IDLE (immediate hardware cutoff)
 ```
 
-**Changed this session:** Stop Sputter now transitions directly to `VENTING` instead of `READY` — sputtering should always be followed by a vent cycle rather than holding vacuum. The Start Sputter / Stop Sputter buttons now occupy the same grid cell and swap visibility based on state, rather than both being shown with one disabled.
-
 ### Automatic Transitions
 
 | From | To | Condition | Where |
 |---|---|---|---|
 | `IDLE` | `PUMP_DOWN` | Pirani voltage ≤ 2.71V (10 mbar) | `_poll()` |
 | `PUMP_DOWN` | `IDLE` | Pirani voltage ≥ 2.71V (pump failure/leak) | `_poll()` + `sm.update()` |
-| `PUMP_DOWN` | `READY` | Voltage ≤ 0.15V AND opto enabled | `sm.update()` |
+| `PUMP_DOWN` | `READY` | Voltage ≤ 0.2V AND opto enabled | `sm.update()` |
 | `READY` | `PUMP_DOWN` | Pirani voltage ≥ 2.71V (pressure degraded) | `sm.update()` |
-| `ARGON_FLUSH` | `PLASMA_IGNITING` | Voltage ≥ 1.287V (0.09 mbar) | `_poll()` only — guarded against double-fire (see below) |
+| `ARGON_FLUSH` | `PLASMA_IGNITING` | Voltage ≥ 1.287V (0.09 mbar) | **`_poll()` only** — sole owner: arms the ignition timeout and fires `_ignite_plasma()` |
 | `PLASMA_IGNITING` | `READY` | 120s timeout, no plasma confirmation | `_poll()` |
-| `VENTING` | `IDLE` | Pirani voltage ≥ **2.5V** | `sm.update()` — switched from ADC-count threshold to direct voltage this session |
+| `VENTING` | `IDLE` | Pirani voltage ≥ 2.5V | `sm.update()` |
 
-**Double-transition fix:** Previously both `_poll()` and `sm.update()` independently checked the ARGON_FLUSH → PLASMA_IGNITING condition on the same tick, risking `_ignite_plasma()` firing twice once RF hardware is wired up. A `plasma_ignition_triggered` flag in shared state now gates this — set when `_poll()` fires the transition, cleared on confirm or timeout.
+`PLASMA_IGNITING → SPUTTER_READY` is **operator-only** (Confirm Plasma button) — there is deliberately no sensor-driven path, since there is no plasma detection hardware yet.
 
 ### Manual Transitions (Operator Buttons)
 
@@ -172,7 +232,7 @@ Sputter_ctrl/
 | Start Argon Flush | `READY → ARGON_FLUSH` | Argon inlet ≥ 15 psi |
 | Confirm Plasma | `PLASMA_IGNITING → SPUTTER_READY` | None |
 | Start Sputter | `SPUTTER_READY → SPUTTERING` | Argon inlet ≥ 15 psi |
-| Stop Sputter | `SPUTTERING → VENTING` | None *(changed from → READY)* |
+| Stop Sputter | `SPUTTERING → VENTING` | None |
 | Vent | Most states → `VENTING` | None |
 | E-STOP | Any → `IDLE` | None — immediate |
 
@@ -180,37 +240,39 @@ Sputter_ctrl/
 
 `handle_hardware_interlocks()` fires synchronously on every state transition:
 
-- **→ IDLE or VENTING**: `mfc.set_flow(0)`, `mfc.valve_close()`, `pirani.set_opto(False)`, resets `sputter_target_mbar` and `argon_pressure` in shared state back to their defaults (0.007 mbar, 0 psi), and clears `_manual_dac_override`
+- **→ IDLE or VENTING**: `mfc.set_flow(0)`, `mfc.valve_close()`, `pirani.set_opto(False)`, and resets `plasma_ignition_start` / `plasma_ignition_triggered` so the next flush cycle starts clean (a stale flag previously could leave PLASMA_IGNITING with no armed timeout)
 - **→ PUMP_DOWN**: `pirani.set_opto(False)` — resets opto for next pump-down cycle
 
-The previous version had this split across two redundant `if new_state in ["IDLE", "VENTING"]` blocks (one for MFC, one for opto) — consolidated into one this session.
+During VENTING the poll loop additionally holds the MFC valve **closed** every tick (venting is done with the turbo inlet valve, not through the MFC).
 
 ---
 
 ## Pressure Reference
 
-All voltages are post-divider (ADC input, ×0.33 from raw gauge output). Conversion between Pirani voltage and mbar now uses **log-linear interpolation** against the full manufacturer calibration table (`_PIRANI_CAL` in `main.py`), not a fixed linear scale — the Pirani gauge's thermal-conductivity response is logarithmic, so linear interpolation introduced visible error at intermediate setpoints.
+All voltages are post-divider (ADC input, ×0.33 from raw gauge output). Conversion between Pirani voltage and mbar uses **log-linear interpolation** against the full manufacturer calibration table (`_PIRANI_CAL` in `main.py`, source PDF in `Docs/`): linear in voltage, logarithmic in pressure, matching the gauge's thermal-conductivity response. Both directions are implemented (`mbar_to_adc_voltage`, `adc_voltage_to_mbar`) and round-trip to machine precision at all 51 table points.
 
 | Pressure (mbar) | Raw gauge (V) | ADC input (V) | Significance |
 |---|---|---|---|
 | 999 | 10.00 | 3.30 | Atmosphere (ADC saturated) |
 | 10 | 8.20 | 2.706 | `IDLE_PRESSURE_MAX_VOLTAGE` — pump-down gate |
 | 0.09 | 3.90 | 1.287 | `ARGON_FLUSH_TARGET_VOLTAGE` — plasma ignition pressure |
-| 0.007 | 1.10 | 0.363 | `SPUTTER_READY_TARGET_VOLTAGE` — default sputtering pressure |
-| ~0.01 | 1.55 | 0.512 | `PUMP_DOWN_COMPLETE_VOLTAGE` (0.15V) — high vacuum confirmed, raised from 0.051V this session for reliable PUMP_DOWN → READY triggering |
+| ~0.09 | 3.94 | 1.3 | Turbo enable opto fires (PUMP_DOWN, transition-based) |
+| 0.01 | 1.55 | 0.512 | `TURBO_VALVE_OPEN_MBAR` — inlet valve opens during VENTING |
+| ~0.0037 | 0.61 | 0.2 | `PUMP_DOWN_COMPLETE_VOLTAGE` — PUMP_DOWN → READY gate |
+| 0.007 | 1.10 | 0.363 | 0.007 mbar — default sputtering pressure |
 | 2.5 (ADC volts) | — | 2.5 | `VENTING_COMPLETE_VOLTAGE` — VENTING → IDLE |
 
-The GUI now displays live pressure in mbar (`adc_voltage_to_mbar()`) alongside raw Pirani voltage, computed via the inverse of the same log-linear table.
+The GUI displays live pressure in mbar (bold, under the voltage readout), computed via `adc_voltage_to_mbar()`; reads `ATM (>999 mbar)` at ADC saturation.
 
 ### Sputter Target Pressure (operator-settable)
 
-A new input field lets the operator set the SPUTTER_READY / SPUTTERING target pressure directly in mbar (default 0.007), rather than relying on the fixed `SPUTTER_READY_TARGET_VOLTAGE` constant. Entered values are converted to an ADC voltage target via the calibration table before being passed to `pressure_control_step()`. Resets to default on any transition to VENTING or IDLE.
+An input field sets the SPUTTER_READY / SPUTTERING target pressure directly in mbar (default 0.007). Entered values are converted to an ADC voltage target via the calibration table before being passed to `pressure_control_step()`.
 
-### Opto Logic (Turbo Enable, GPIO 17)
+### Turbo Enable Opto Logic (GPIO 17)
 
 Transition-based, not level-based:
 
-- Goes **HIGH** the first time Pirani voltage drops below **1.2V** during `PUMP_DOWN`
+- Goes **HIGH** the first time Pirani voltage drops below **1.3V** during `PUMP_DOWN`
 - Once set, stays HIGH until any state transition resets it via the interlock callback
 - This prevents opto chatter on noisy ADC readings near the threshold
 
@@ -226,18 +288,19 @@ git clone https://github.com/<your-username>/Sputter_ctrl.git ~/Sputter_ctrl
 cd ~/Sputter_ctrl
 ```
 
-### 2. Enable I2C on the Pi
+### 2. Enable the Software I2C Bus
+
+Hardware I2C (pins 3/5) is dead on this Pi — the software bus overlay is **required**. Append to `/boot/firmware/config.txt` and reboot:
 
 ```bash
-sudo raspi-config
-# Interface Options → I2C → Enable
-# Reboot when prompted
+echo "dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=24,i2c_gpio_delay_us=2" | sudo tee -a /boot/firmware/config.txt
+sudo reboot
 ```
 
-Verify both devices are visible on the I2C bus:
+Verify both devices are visible:
 
 ```bash
-i2cdetect -y 1
+i2cdetect -y 3
 # Should show 0x48 (ADS1115) and 0x60 (MCP4725)
 ```
 
@@ -249,7 +312,7 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-This installs `adafruit-blinka`, `adafruit-circuitpython-ads1x15`, `adafruit-circuitpython-mcp4725`, and `RPi.GPIO` into a venv at `~/Sputter_ctrl/venv/`, and adds a `source_sputt` alias to `~/.bashrc`.
+This installs `adafruit-blinka`, `adafruit-circuitpython-ads1x15`, `adafruit-extended-bus`, and `RPi.GPIO` into a venv at `~/Sputter_ctrl/venv/`, and adds a `source_sputt` alias to `~/.bashrc`.
 
 ```bash
 source ~/.bashrc
@@ -277,7 +340,14 @@ ssh -X raspberrypi@<pi-ip>
 source_sputt && cd ~/Sputter_ctrl && python main.py
 ```
 
-The Pi's current IP address is shown live in the GUI header and updates automatically if the network changes.
+Bench-test scripts (run these with `main.py` stopped — they fight over pins):
+
+```bash
+python tests/adc_test.py          # live ADC readings, both channels
+python tests/dac_test.py          # DAC voltage staircase + register readback
+python tests/opto_test.py         # GPIO 17 toggle every 5 s
+python tests/turbo_valve_test.py  # GPIO 22 relay/valve toggle every 5 s
+```
 
 ---
 
@@ -286,45 +356,52 @@ The Pi's current IP address is shown live in the GUI header and updates automati
 All tunable parameters are in `config.py`. Key constants:
 
 ```python
+# I2C
+I2C_BUS_NUMBER               = 3       # software i2c-gpio bus (1 = dead hardware bus)
+ADS1115_I2C_ADDRESS          = 0x48
+ARGON_DAC_I2C_ADDRESS        = 0x60
+
+# GPIO (BCM)
+GPIO_PIRANI_PIN              = 17      # turbo enable opto
+GPIO_MFC_VALVE_CLOSE_PIN     = 27      # emergency valve close
+GPIO_TURBO_VALVE_PIN         = 22      # turbo inlet valve relay (was GPIO 4 — dead pad)
+
 # Pressure thresholds (post-divider volts unless noted)
 IDLE_PRESSURE_MAX_VOLTAGE    = 2.71    # 10 mbar  — pump-down gate
-PUMP_DOWN_COMPLETE_VOLTAGE   = 0.15    # ~0.01 mbar — high vacuum confirmed
+PUMP_DOWN_COMPLETE_VOLTAGE   = 0.2     # PUMP_DOWN → READY gate
 ARGON_FLUSH_TARGET_VOLTAGE   = 1.287   # 0.09 mbar — plasma ignition pressure
-SPUTTER_READY_TARGET_VOLTAGE = 0.363   # 0.007 mbar — default sputtering pressure
-VENTING_COMPLETE_VOLTAGE     = 2.5     # VENTING -> IDLE threshold
+VENTING_COMPLETE_VOLTAGE     = 2.5     # VENTING → IDLE threshold
+TURBO_VALVE_OPEN_MBAR        = 0.01    # inlet valve opens above this during VENTING
 
 # Pressure PID control
 ARGON_FLUSH_FLOW_SETPOINT    = 150.0   # sccm — initial flow on flush entry
 PRESSURE_CONTROL_KP          = 8.0     # sccm/V — proportional gain (tuned)
 PRESSURE_CONTROL_KD          = 3.0     # sccm·s/V — derivative gain (tuned)
-PRESSURE_CONTROL_KI          = 0.05    # sccm/(V·s) — integral gain (tuned down from 0.5, was unstable)
-PRESSURE_CONTROL_ICLAMP      = 50.0    # sccm — anti-windup clamp on integral contribution
+PRESSURE_CONTROL_KI          = 0.005   # sccm/(V·s) — integral gain
+PRESSURE_CONTROL_ICLAMP      = 50.0    # sccm — anti-windup clamp (KI=0 is safe)
 
 # Timing
 PLASMA_IGNITION_TIMEOUT      = 120.0   # seconds — auto-abort if plasma not confirmed
-POLLING_INTERVAL             = 0.2     # seconds between sensor reads (lowered from 0.5)
-GUI_REFRESH_INTERVAL         = 200     # ms between GUI updates (lowered from 500)
+POLLING_INTERVAL             = 0.2     # seconds between sensor reads
+GUI_REFRESH_INTERVAL         = 200     # ms between GUI updates
+ERROR_DISPLAY_SECONDS        = 10      # status-bar error auto-expiry
 
-# Hardware
-GPIO_PIRANI_PIN              = 17      # BCM — turbo enable opto
-GPIO_MFC_VALVE_CLOSE_PIN     = 27      # BCM — emergency valve close
-GPIO_TURBO_VALVE_PIN         = 4       # BCM — turbo inlet valve opto (HIGH=closed, LOW=open)
-ADS1115_I2C_ADDRESS          = 0x48
-ARGON_DAC_I2C_ADDRESS        = 0x60
-ARGON_DAC_VREF                = 3.3    # MCP4725's real ceiling — Pi 3.3V rail (buffer doesn't raise this)
+# MFC / DAC
 MFC_FULL_SCALE               = 700.0   # sccm
 MFC_GAS_CORRECTION_FACTOR    = 1.39    # Argon correction for MKS 1179A
+ARGON_DAC_VREF               = 5.0
+ARGON_DAC_RESOLUTION         = 4096
 ```
 
 ### Tuning the Pressure PID Loop
 
-Current tuned values (Kp=8, Kd=3, Ki=0.05) were arrived at empirically on hardware:
+Current tuned values (Kp=8, Kd=3) were arrived at empirically on hardware:
 
 - Started at Kp=40 (original, P-only) — produced slow, large-amplitude oscillation
 - Dropped to Kp=10 — oscillation reduced significantly but response was sluggish
 - Raised to Kp=20, added Kd=3–7 — eliminated overshoot at the 0.09 mbar (ARGON_FLUSH) setpoint, but undershoot persisted at 0.007 mbar (SPUTTER_READY) since the same gains behave differently at very different flow regimes
-- Settled at Kp=17→8 (further reduced after switching `POLLING_INTERVAL` from 0.5s to 0.2s, which made the derivative term ~2.5× more aggressive for the same physical Kd — **gains must be retuned whenever `POLLING_INTERVAL` changes**), Kd=7→3, with undershoot at 0.007 mbar reduced from 0.005 to 0.006 mbar (closer to target)
-- I-term added to address a small persistent offset (target 0.06 mbar settling at ~0.055); Ki=0.5 caused significant overshoot, reduced to Ki=0.05 with anti-windup clamping (`PRESSURE_CONTROL_ICLAMP`) to prevent integral runaway when the MFC is saturated at the DAC ceiling
+- Settled at Kp=17→8 (further reduced after switching `POLLING_INTERVAL` from 0.5s to 0.2s, which made the derivative term ~2.5× more aggressive for the same physical Kd — **gains must be retuned whenever `POLLING_INTERVAL` changes**), Kd=7→3
+- I-term added to address a small persistent offset; large Ki caused overshoot, kept small with anti-windup clamping (`PRESSURE_CONTROL_ICLAMP`). Setting Ki=0 while tuning is safe (no divide-by-zero).
 
 If you change `POLLING_INTERVAL`, expect to retune Kd and Ki — both depend on `dt` between samples.
 
@@ -334,7 +411,7 @@ If you change `POLLING_INTERVAL`, expect to retune Kd and Ki — both depend on 
 
 | Element | Description |
 |---|---|
-| **Pi IP** | Live IP address, updates automatically on network change |
+| **Pi IP** | Live IP address shown in header |
 | **Process State** | Current state, colour-coded |
 | **Start Argon Flush** | Opens MFC valve, starts PID loop to 0.09 mbar |
 | **Confirm Plasma** | Manually confirms plasma ignition; transitions to SPUTTER_READY |
@@ -342,39 +419,87 @@ If you change `POLLING_INTERVAL`, expect to retune Kd and Ki — both depend on 
 | **Stop Sputter** | Ends sputtering, transitions directly to VENTING |
 | **Vent** | Vents chamber to atmosphere |
 | **E-STOP** | Immediate: kills flow, closes valve, drops opto, returns to IDLE |
-| **Sputter P (mbar)** | Operator-set target pressure for SPUTTER_READY/SPUTTERING; press Set or Enter |
-| **Argon PSI** | Enter upstream argon regulator pressure; required ≥ 15 psi to start flush/sputter; press Update or Enter |
-| **Pirani voltage + Pressure (mbar)** | Live readings, mbar computed via log-linear calibration table |
+| **Voltage + Pressure (mbar)** | Live Pirani readings; mbar via log-linear calibration table |
+| **OPTO** | Green = turbo enable opto on; Red = off |
+| **T-VALVE** | Green `CLOSED` = inlet valve shut (normal); Orange `OPEN (venting)` = venting above 0.01 mbar |
+| **Sputter P (mbar)** | Operator-set target pressure; press Set or Enter |
+| **Argon PSI** | Operator-entered regulator pressure; ≥ 15 psi required for flush/sputter |
 | **Pirani graph** | Scrolling ADC voltage (lime, 0–4V, 60 samples) |
 | **MFC graph** | Scrolling flow sccm (cyan) overlaid with DAC voltage (yellow dashed) |
-| **OPTO** | Green = turbo interlock enabled; Red = off |
 | **DAC OUT** | Green = DAC found on I2C; Red = not detected |
 | **Valve** | Green = released (MFC in control); Red = closed (emergency) |
-
-Start Sputter / Stop Sputter buttons share one grid cell and swap automatically based on state, rather than appearing side by side with one disabled.
+| **Status bar** | Errors shown in red, auto-expire after 10 s |
 
 ---
 
 ## Known Limitations
 
-- **DAC ceiling at 3.3V**: The MCP4725 is powered from the Pi 3.3V rail. Now buffered through an LM358P unity-gain follower (driven from 5V) so it can reliably *deliver* its full 0–3.3V range under load — but the DAC itself still cannot exceed 3.3V, capping commanded MFC flow at roughly 46% of full scale (~322 sccm) until a true level-shifted 5V DAC path is added.
-- **Turbo opto failures (GPIO 17)**: Two 4N35s have failed in testing, suspected inductive kickback from the turbo controller input. No flyback diode is currently installed — recommended before further runs (see Hardware Overview).
-- **Turbo inlet valve interlock is pressure-based, not RPM-based**: opens above 0.1 mbar regardless of actual turbo spindown state. A proper interlock needs the EXC120 analogue speed output wired to an ADC channel.
+- **Three dead GPIO pads** (GPIO 2, 3, 4) from the early hardware issue — see [Hardware Notes](#hardware-notes). Software I2C bus 3 and GPIO 22 are the workarounds; a replacement Pi would allow reverting to hardware I2C.
+- **Turbo enable opto (GPIO 17) is marginal**: the enable input draws ~15–30 mA, beyond a 4N35's ~10 mA saturated capability at legal GPIO LED drive. Currently only works with excess LED current. Proper fix (BC547 output buffer) designed but not yet installed.
+- **DAC ceiling at 3.3V**: MCP4725 powered from the Pi 3.3V rail, buffered through the LM358P for current but capped at 3.3V — commanded MFC flow limited to roughly 46% of full scale (~322 sccm) until a level-shifted 5V DAC path is added.
+- **MFC feedback (A1) scaling unverified**: the MKS 1179A feedback is 0–5V; whether A1 has a divider (and therefore what full-scale voltage means) has not been confirmed — displayed flow may be scaled wrong, and an undivided 5V input would over-stress the ADS1115.
+- **Argon PSI guard is honor-system**: the ≥15 psi check reads an operator-entered value, not a sensor, and the entered value persists across runs.
+- **No series protection resistors on ADC inputs yet** — recommended after general input protection.
 - **`_ignite_plasma()` is a stub**: RF power supply trigger is not yet implemented.
-- **SPUTTERING state pressure control uses the same operator-set target as SPUTTER_READY**: there's no separate process recipe / ramp profile yet.
-- **Pirani gauge readings may drift**: observed mismatch between commanded and indicated pressure even after confirming the control loop and calibration interpolation were correct — suspected gauge aging or thermal drift, not yet root-caused.
+- **Pirani gauge readings may drift**: at atmosphere A0 has been observed at ~3.04V where the table expects ~3.3V — either partial vacuum at time of reading, or the divider ratio is slightly under 0.33. Not yet root-caused.
 
 ---
 
-## Pending Features
+## Roadmap
 
-- [ ] Flyback diode + pulldown on turbo enable opto circuit (GPIO 17) to prevent further 4N35 failures
-- [ ] RPM-based turbo inlet valve interlock using EXC120 analogue speed output (pins 16/17), replacing the current pressure-based gate
-- [ ] RF power supply trigger in `_ignite_plasma()`
-- [ ] Current sensor integration for automatic plasma detection
-- [ ] Plasma frame GUI controls (right panel — currently placeholder)
-- [ ] DAC level shifter / dedicated 5V supply for full MFC range
-- [ ] Datalog / CSV export of Pirani and MFC readings
-- [ ] Per-state PID gain sets (ARGON_FLUSH and SPUTTER_READY have different dynamics)
-- [ ] Investigate Pirani gauge drift/calibration mismatch
-- [ ] Config hot-reload (was scoped, descoped this session — full code hot-reload would still require a restart for logic/GUI changes)
+Goals only, near-term → eventual. Inspired in part by how production fabs structure
+tool control: hardwired interlocks under software, standardized state/alarm/recipe
+models (SECS/GEM), and fault detection built on ruthless data collection.
+
+### Harden the platform
+
+- [ ] **Software armor**: single safety gate at the top of `_poll()`, startup hardware
+      self-test, watchdog (heartbeat + Pi hardware watchdog), persistent error log,
+      config validation at launch
+- [ ] **Simulation mode**: fake-hardware flag so the full state machine + GUI run on
+      any laptop (the unit suite in `tests/unit/` already fakes the hardware layer;
+      extend it into a live interactive sim)
+- [ ] **Trustworthy analog front-end**: protected, calibrated sensor inputs with the
+      divider ratios measured rather than assumed (Pirani atmosphere anomaly resolved)
+
+### Make it a deposition machine
+
+- [ ] **First characterized film**: complete a full run and measure the result — the
+      milestone everything above serves
+- [ ] **Full plasma integration**: supply trigger in `_ignite_plasma()` (with arc
+      suppression confirmed in hardware), automatic plasma detection via current
+      sensing, plasma GUI panel replacing the placeholder
+- [ ] **True turbo protection**: RPM-based inlet valve interlock from the EXC120
+      speed output, replacing the pressure-based gate
+- [ ] **Full-range MFC control**: level-shifted 5V DAC path removing the ~46%
+      flow ceiling
+- [ ] **Per-state PID gain sets**: ARGON_FLUSH and SPUTTER_READY dynamics differ;
+      gains should switch with state
+
+### Operate like a fab tool
+
+- [ ] **Data collection & FDC-lite**: log every run (pressure/flow/DAC traces),
+      build known-good baselines, flag deviation — drift detection instead of
+      surprise failures; dashboarding via Grafana/InfluxDB is the natural backend
+- [ ] **Process recipes**: runs defined as recipe files (target pressure, power,
+      time, ramp profiles) executed start-to-finish — repeatability over button-pressing
+- [ ] **Alarm model**: separate operator-info messages from latched alarms that
+      require acknowledgement, GEM-style
+- [ ] **Maintenance counters**: target erosion time, pump hours, cycles since vent —
+      scheduled maintenance instead of run-to-failure
+
+### Eventual
+
+- [ ] **Unattended operation**: headless mode, remote monitoring and alarm
+      notifications — the point where the watchdog and plasma detection stop being
+      optional
+- [ ] **Host interface**: expose state/data/recipes over the network (simple JSON
+      socket, or the `secsgem` Python library for a real SEMI E30 interface) so the
+      tool can be driven like production fab equipment
+- [ ] **Run-to-run control**: adjust the next recipe from measurements of the last
+      film — closing the outermost loop
+- [ ] **MCU delegation layer**: when commercial smart boxes (MFC, supply) get
+      replaced by homebuilt hardware, delegate the fast loops to a dedicated
+      microcontroller under the Pi (the SputterOS-shaped slot in this architecture)
+- [ ] **Replicable kit**: documentation and BOM good enough that another lab can
+      build this machine from the repo alone
