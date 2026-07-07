@@ -27,7 +27,7 @@ A Raspberry Pi-based vacuum process controller for DC magnetron sputter depositi
 |---|---|---|---|
 | Microcontroller | Raspberry Pi 2B (BCM GPIO) | — | Host for all control logic |
 | Pirani gauge | ACE Instruments DHPG-015 | Analog 0–10V | Divided to 0–3.3V before ADC (ratio 0.33) |
-| ADC | ADS1115 | **I2C bus 3** @ 0x48 | Pirani on A0, MFC feedback on A1 |
+| ADC | ADS1115 | **I2C bus 3** @ 0x48 | Pirani on A0, MFC feedback on A1, turbo RPM tach on A2 |
 | MFC | MKS 1179A | Analog 0–5V setpoint | 0–700 sccm Argon |
 | DAC | MCP4725 | **I2C bus 3** @ 0x60 | Powered off Pi 3.3V rail — buffered, see below |
 | DAC buffer | LM358P op-amp | Analog | Unity-gain follower; required, DAC alone cannot drive MFC setpoint input |
@@ -84,9 +84,15 @@ Valve circuit ── relay COM + NC contacts (isolated from the Pi)
 ```
 
 - Valve is wired through the relay's **NC (normally closed)** contact: relay released = valve circuit shorted = **valve CLOSED**; relay energized = **valve OPEN**.
-- Logic (in `_poll()`): valve held CLOSED at all times; **latched OPEN** the first time pressure rises above `TURBO_VALVE_OPEN_MBAR` (0.01 mbar) during **VENTING**; re-closed automatically on leaving VENTING. Latching prevents relay chatter from ADC noise around the threshold.
+- Logic (in `_poll()`, `turbo_valve_step()`): valve held CLOSED at all times; **latched OPEN** during **VENTING** once turbo pump RPM (tach on ADC A2, see [Turbo Pump RPM](#turbo-pump-rpm-adc-a2)) sustains `TURBO_VALVE_CONFIRM_SAMPLES` consecutive reads at or below `TURBO_VALVE_OPEN_RPM_MAX` (20000 RPM); re-closed automatically on leaving VENTING. The debounce prevents a single corrupted I2C read from opening the valve; the latch prevents relay chatter once open. Driven by rotor speed directly rather than inferring it from chamber pressure — the earlier pressure-based gate (`TURBO_VALVE_OPEN_MBAR`) has been replaced.
 - Fail-safe: if the Pi crashes or loses power, the relay releases and the valve **fails closed** — the safe direction for the turbo inlet.
 - GUI shows live actuation state (`T-VALVE : CLOSED` / `OPEN (venting)`).
+
+### Turbo Pump RPM (ADC A2)
+
+- Tach/speed output, 0–3.3V linear = 0–90000 RPM (`TURBO_RPM_VOLTAGE_FULL_SCALE`, `TURBO_RPM_FULL_SCALE`), read by `TurboRPMController` (`turbo_rpm.py`) every poll tick regardless of state.
+- Displayed in the Pirani panel, right edge (`T-RPM`, `T-RPM V`) — value and raw ADC voltage both shown.
+- Feeds the turbo inlet valve interlock above; not used for any other control decision.
 
 Do **not** drive relay coils or solenoids from a 4N35 directly — see the hard-won rule below.
 
@@ -125,9 +131,9 @@ main.py
 ├── Hardware init (GPIO, ExtendedI2C bus 3, ADS1115)
 ├── Shared state dict (thread-safe, _lock)
 ├── Polling thread (_poll) — runs every POLLING_INTERVAL (0.2s)
-│   ├── Reads Pirani + MFC sensors
+│   ├── Reads Pirani + MFC + turbo RPM (A2) sensors
 │   ├── Drives MFC pressure PID loop
-│   ├── Drives turbo inlet valve latch (GPIO 22)
+│   ├── Drives turbo inlet valve latch (GPIO 22), gated on turbo RPM (not pressure)
 │   ├── Calls sm.update() for auto-transitions
 │   ├── Converts Pirani voltage <-> mbar via log-linear calibration table
 │   ├── End-of-tick safety cutoff re-assert (E-STOP race guard)
@@ -160,6 +166,7 @@ Sputter_ctrl/
 ├── state_machine.py   — SputterStateMachine class
 ├── mfc_control.py     — MFCController class (DAC, valve, PID loop)
 ├── pirani.py          — PiraniController class (ADC, turbo enable opto)
+├── turbo_rpm.py       — TurboRPMController class (ADC A2 tach → RPM)
 ├── graph.py           — ScrollingGraph class (pure Tkinter, no matplotlib)
 ├── setup.sh           — venv + dependency installer
 ├── Docs/              — Pirani calibration datasheet PDF
@@ -257,7 +264,6 @@ All voltages are post-divider (ADC input, ×0.33 from raw gauge output). Convers
 | 10 | 8.20 | 2.706 | `IDLE_PRESSURE_MAX_VOLTAGE` — pump-down gate |
 | 0.09 | 3.90 | 1.287 | `ARGON_FLUSH_TARGET_VOLTAGE` — plasma ignition pressure |
 | ~0.09 | 3.94 | 1.3 | Turbo enable opto fires (PUMP_DOWN, transition-based) |
-| 0.01 | 1.55 | 0.512 | `TURBO_VALVE_OPEN_MBAR` — inlet valve opens during VENTING |
 | ~0.0037 | 0.61 | 0.2 | `PUMP_DOWN_COMPLETE_VOLTAGE` — PUMP_DOWN → READY gate |
 | 0.007 | 1.10 | 0.363 | 0.007 mbar — default sputtering pressure |
 | 2.5 (ADC volts) | — | 2.5 | `VENTING_COMPLETE_VOLTAGE` — VENTING → IDLE |
@@ -371,7 +377,13 @@ IDLE_PRESSURE_MAX_VOLTAGE    = 2.71    # 10 mbar  — pump-down gate
 PUMP_DOWN_COMPLETE_VOLTAGE   = 0.2     # PUMP_DOWN → READY gate
 ARGON_FLUSH_TARGET_VOLTAGE   = 1.287   # 0.09 mbar — plasma ignition pressure
 VENTING_COMPLETE_VOLTAGE     = 2.5     # VENTING → IDLE threshold
-TURBO_VALVE_OPEN_MBAR        = 0.01    # inlet valve opens above this during VENTING
+
+# Turbo pump RPM (tach on ADC A2) and inlet valve interlock
+ADC_CHANNEL_TURBO_RPM        = 2
+TURBO_RPM_VOLTAGE_FULL_SCALE = 3.3     # volts at A2 for full-scale RPM
+TURBO_RPM_FULL_SCALE         = 90000.0 # RPM at full-scale voltage
+TURBO_VALVE_OPEN_RPM_MAX     = 20000   # inlet valve opens once RPM drops to/below this
+TURBO_VALVE_CONFIRM_SAMPLES  = 3       # consecutive reads required before opening (debounce)
 
 # Pressure PID control
 ARGON_FLUSH_FLOW_SETPOINT    = 150.0   # sccm — initial flow on flush entry
@@ -421,7 +433,8 @@ If you change `POLLING_INTERVAL`, expect to retune Kd and Ki — both depend on 
 | **E-STOP** | Immediate: kills flow, closes valve, drops opto, returns to IDLE |
 | **Voltage + Pressure (mbar)** | Live Pirani readings; mbar via log-linear calibration table |
 | **OPTO** | Green = turbo enable opto on; Red = off |
-| **T-VALVE** | Green `CLOSED` = inlet valve shut (normal); Orange `OPEN (venting)` = venting above 0.01 mbar |
+| **T-VALVE** | Green `CLOSED` = inlet valve shut (normal); Orange `OPEN (venting)` = venting and turbo RPM has dropped to/below `TURBO_VALVE_OPEN_RPM_MAX` |
+| **T-RPM / T-RPM V** | Right edge of the Pirani panel; turbo pump RPM (ADC A2) and its raw ADC voltage, read every tick |
 | **Sputter P (mbar)** | Operator-set target pressure; press Set or Enter |
 | **Argon PSI** | Operator-entered regulator pressure; ≥ 15 psi required for flush/sputter |
 | **Pirani graph** | Scrolling ADC voltage (lime, 0–4V, 60 samples) |
@@ -469,8 +482,10 @@ models (SECS/GEM), and fault detection built on ruthless data collection.
 - [ ] **Full plasma integration**: supply trigger in `_ignite_plasma()` (with arc
       suppression confirmed in hardware), automatic plasma detection via current
       sensing, plasma GUI panel replacing the placeholder
-- [ ] **True turbo protection**: RPM-based inlet valve interlock from the EXC120
-      speed output, replacing the pressure-based gate
+- [x] **True turbo protection**: RPM-based inlet valve interlock (ADC A2, tach
+      output), replacing the pressure-based gate — implemented in software
+      (`turbo_valve_step()`, `TURBO_VALVE_OPEN_RPM_MAX`); not yet validated
+      against a real vent cycle on hardware
 - [ ] **Full-range MFC control**: level-shifted 5V DAC path removing the ~46%
       flow ceiling
 - [ ] **Per-state PID gain sets**: ARGON_FLUSH and SPUTTER_READY dynamics differ;

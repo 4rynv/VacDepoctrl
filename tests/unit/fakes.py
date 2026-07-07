@@ -180,7 +180,7 @@ def load_calibration(repo_root):
     end = src.index("from pirani")
     # turbo_valve_step references these config globals at call time
     ns = {"math": math,
-          "TURBO_VALVE_OPEN_MBAR": config.TURBO_VALVE_OPEN_MBAR,
+          "TURBO_VALVE_OPEN_RPM_MAX": config.TURBO_VALVE_OPEN_RPM_MAX,
           "TURBO_VALVE_CONFIRM_SAMPLES": config.TURBO_VALVE_CONFIRM_SAMPLES}
     exec(src[start:end], ns)
     return ns

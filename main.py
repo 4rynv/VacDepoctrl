@@ -37,7 +37,8 @@ from config import (
     ADS1115_I2C_ADDRESS,
     ARGON_DAC_VREF,
     GPIO_TURBO_VALVE_PIN,
-    TURBO_VALVE_OPEN_MBAR,
+    TURBO_VALVE_OPEN_RPM_MAX,
+    TURBO_VALVE_CONFIRM_SAMPLES,
     I2C_BUS_NUMBER,
 )
 # Pirani calibration table: (mbar, gauge_voltage) from datasheet
@@ -91,25 +92,28 @@ def adc_voltage_to_mbar(voltage):
             return math.exp(math.log(p_lo) + t * (math.log(p_hi) - math.log(p_lo)))
     return cal[-1][0]
 
-def turbo_valve_step(venting, mbar, valve_open, above_ticks):
+def turbo_valve_step(venting, rpm, valve_open, below_ticks):
     """Debounced turbo inlet valve latch. Pure decision logic — no I/O.
 
-    The valve may only open during VENTING, and only after
-    TURBO_VALVE_CONFIRM_SAMPLES consecutive readings above
-    TURBO_VALVE_OPEN_MBAR: a single corrupted read on the software I2C
-    bus (EMI bit-flips return garbage without raising) must not latch
-    the valve open. A below-threshold reading resets the count. Once
-    open, the valve stays latched open (no relay chatter) until VENTING
-    is left; leaving VENTING also clears the count so a partial count
-    can't carry into the next vent. Returns (valve_open, above_ticks).
+    Driven by turbo pump RPM (tach on ADC A2), not chamber pressure: the
+    rotor's own speed is the direct signal for whether it's safe to admit
+    gas, rather than inferring rotor state from pressure. The valve may
+    only open during VENTING, and only after TURBO_VALVE_CONFIRM_SAMPLES
+    consecutive readings at or below TURBO_VALVE_OPEN_RPM_MAX: a single
+    corrupted read on the software I2C bus (EMI bit-flips return garbage
+    without raising) must not latch the valve open. An above-threshold
+    reading resets the count. Once open, the valve stays latched open (no
+    relay chatter) until VENTING is left; leaving VENTING also clears the
+    count so a partial count can't carry into the next vent. Returns
+    (valve_open, below_ticks).
     """
     if not venting:
         return False, 0
     if valve_open:
         return True, 0
-    if mbar > TURBO_VALVE_OPEN_MBAR:
-        above_ticks += 1
-        return above_ticks >= TURBO_VALVE_CONFIRM_SAMPLES, above_ticks
+    if rpm <= TURBO_VALVE_OPEN_RPM_MAX:
+        below_ticks += 1
+        return below_ticks >= TURBO_VALVE_CONFIRM_SAMPLES, below_ticks
     return False, 0
 
 from pirani        import PiraniController
@@ -126,7 +130,7 @@ GPIO.setmode(GPIO.BCM)
 
 # Turbo inlet valve (GPIO 4 -> BC547 -> relay, valve on NC contact):
 # LOW = relay released = NC shorted = valve CLOSED. Held closed from startup;
-# driven HIGH (valve open) only above TURBO_VALVE_OPEN_MBAR during VENTING (see _poll).
+# driven HIGH (valve open) only at/below TURBO_VALVE_OPEN_RPM_MAX during VENTING (see _poll).
 GPIO.setup(GPIO_TURBO_VALVE_PIN, GPIO.OUT)
 GPIO.output(GPIO_TURBO_VALVE_PIN, GPIO.LOW)
 
@@ -260,7 +264,7 @@ _stop_event = threading.Event()
 
 def _poll():
     turbo_valve_open = False  # Pin driven LOW (valve closed) during hardware init
-    turbo_above_ticks = 0     # Consecutive VENTING reads above TURBO_VALVE_OPEN_MBAR
+    turbo_below_ticks = 0     # Consecutive VENTING reads at/below TURBO_VALVE_OPEN_RPM_MAX
     while not _stop_event.is_set():
         start_time = time.time()  # Track start time for precise loop interval timing
         try:
@@ -341,20 +345,21 @@ def _poll():
                 p = pirani.read(auto_opto=True)
                 mfc.valve_release()
 
+            r = turbo_rpm.read()  # Read every tick regardless of state (display + valve gate)
+
             # Turbo inlet valve: held CLOSED (LOW) at all times, except latched
             # OPEN (HIGH) during VENTING after TURBO_VALVE_CONFIRM_SAMPLES
-            # consecutive reads above TURBO_VALVE_OPEN_MBAR (see turbo_valve_step).
+            # consecutive reads at/below TURBO_VALVE_OPEN_RPM_MAX (see turbo_valve_step).
             # Re-closed automatically on leaving VENTING.
             was_open = turbo_valve_open
-            turbo_valve_open, turbo_above_ticks = turbo_valve_step(
-                current == "VENTING", adc_voltage_to_mbar(p["voltage"]),
-                turbo_valve_open, turbo_above_ticks)
+            turbo_valve_open, turbo_below_ticks = turbo_valve_step(
+                current == "VENTING", r["rpm"],
+                turbo_valve_open, turbo_below_ticks)
             if turbo_valve_open != was_open:
                 GPIO.output(GPIO_TURBO_VALVE_PIN,
                             GPIO.HIGH if turbo_valve_open else GPIO.LOW)
 
             m = mfc.read()
-            r = turbo_rpm.read()  # Display only; read every tick regardless of state
 
             # Pass the raw ADC counts into the state machine to satisfy the atmosphere transition rule
             sm.update(p["voltage"], pirani_adc=p["adc"], opto_enabled=p["opto_enabled"])
@@ -496,19 +501,25 @@ lbl_p_volt     = tk.Label(pf, text="Voltage : ——.—— V", font=("Courier",
 lbl_p_mbar     = tk.Label(pf, text="Pressure: ——.—— mbar", font=("Courier", 12, "bold"), anchor="w", width=32)
 lbl_opto       = tk.Label(pf, text="OPTO    : ——",      font=("Courier", 14, "bold"), anchor="w", width=32)
 lbl_tvalve     = tk.Label(pf, text="T-VALVE : ——",      font=("Courier", 14, "bold"), anchor="w", width=32)
-lbl_turbo_rpm  = tk.Label(pf, text="T-RPM   : ——.—— RPM", font=("Courier", 12), anchor="w", width=32)
 lbl_p_message  = tk.Label(pf, text="",               font=("Courier", 10), anchor="w", width=80, fg="blue")
-lbl_p_adc .grid(row=0, sticky="w")
-lbl_p_volt.grid(row=1, sticky="w")
-lbl_p_mbar.grid(row=2, sticky="w")
-lbl_opto  .grid(row=3, sticky="w", pady=(6, 0))
-lbl_tvalve.grid(row=4, sticky="w")
-lbl_turbo_rpm.grid(row=5, sticky="w")
-lbl_p_message.grid(row=6, sticky="w", pady=(6, 0))
+lbl_p_adc .grid(row=0, column=0, sticky="w")
+lbl_p_volt.grid(row=1, column=0, sticky="w")
+lbl_p_mbar.grid(row=2, column=0, sticky="w")
+lbl_opto  .grid(row=3, column=0, sticky="w", pady=(6, 0))
+lbl_tvalve.grid(row=4, column=0, sticky="w")
+lbl_p_message.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+# Turbo pump RPM (ADC A2) — pinned to the right edge of the frame,
+# opposite the Pirani gauge stack on the left.
+lbl_turbo_rpm      = tk.Label(pf, text="T-RPM   : ——.—— RPM", font=("Courier", 12), anchor="e", width=24)
+lbl_turbo_rpm_volt = tk.Label(pf, text="T-RPM V : —.——— V",   font=("Courier", 12), anchor="e", width=24)
+lbl_turbo_rpm     .grid(row=3, column=1, sticky="e", padx=(20, 0), pady=(6, 0))
+lbl_turbo_rpm_volt.grid(row=4, column=1, sticky="e", padx=(20, 0))
 
 p_canvas = tk.Canvas(pf, height=90, bg="#1a1a1a", highlightthickness=0)
-p_canvas.grid(row=7, column=0, sticky="ew", pady=(6, 2))
+p_canvas.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 2))
 pf.columnconfigure(0, weight=1)
+pf.columnconfigure(1, weight=1)
 
 p_graph = ScrollingGraph(p_canvas, maxlen=GRAPH_MAX_SAMPLES,
                          min_val=GRAPH_PIRANI_MIN, max_val=GRAPH_PIRANI_MAX,
@@ -681,6 +692,7 @@ def _refresh():
         fg   = "orange"                   if s["turbo_valve_open"] else "green",
     )
     lbl_turbo_rpm.config(text=f"T-RPM   : {s['turbo_rpm']:.0f} RPM")
+    lbl_turbo_rpm_volt.config(text=f"T-RPM V : {s['turbo_rpm_voltage']:.3f} V")
 
     if st == "IDLE":
         p_message = "IDLE: MFC valve closed, turbo opto off."

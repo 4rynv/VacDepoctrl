@@ -88,8 +88,8 @@ class TestConfigSanity(unittest.TestCase):
         self.assertEqual(config.I2C_BUS_NUMBER, 3)
 
     def test_turbo_valve_threshold(self):
-        self.assertGreater(config.TURBO_VALVE_OPEN_MBAR, 0.0)
-        self.assertLess(config.TURBO_VALVE_OPEN_MBAR, 999.0)  # below atmosphere
+        self.assertGreater(config.TURBO_VALVE_OPEN_RPM_MAX, 0.0)
+        self.assertLess(config.TURBO_VALVE_OPEN_RPM_MAX, config.TURBO_RPM_FULL_SCALE)
 
     def test_turbo_valve_confirm_samples(self):
         # >= 2 or a single corrupted I2C read can open the valve
@@ -143,84 +143,87 @@ class TestCalibration(unittest.TestCase):
                 self.assertGreaterEqual(m, prev)
             prev = m
 
-    def test_turbo_valve_threshold_voltage(self):
-        # 1 mbar should sit near 1.881 V ADC per the datasheet table
-        self.assertAlmostEqual(mbar_to_v(config.TURBO_VALVE_OPEN_MBAR),
-                               1.881, places=3)
-
 
 # ════════════════════════════════════════════════════════
 #  Turbo valve debounced latch (from main.py source)
 # ════════════════════════════════════════════════════════
 class TestTurboValveStep(unittest.TestCase):
-    """The valve must never open on readings that don't stay above
-    TURBO_VALVE_OPEN_MBAR for TURBO_VALVE_CONFIRM_SAMPLES consecutive polls."""
+    """The valve must never open on readings that don't stay at/below
+    TURBO_VALVE_OPEN_RPM_MAX for TURBO_VALVE_CONFIRM_SAMPLES consecutive polls.
+    (rpm_safe = rotor slow enough to admit gas; rpm_unsafe = still spinning
+    too fast, valve must stay closed)."""
 
     def setUp(self):
         self.step = CAL["turbo_valve_step"]
         self.N = config.TURBO_VALVE_CONFIRM_SAMPLES
-        self.above = config.TURBO_VALVE_OPEN_MBAR * 2
-        self.below = config.TURBO_VALVE_OPEN_MBAR / 2
+        self.rpm_safe   = config.TURBO_VALVE_OPEN_RPM_MAX / 2
+        self.rpm_unsafe = config.TURBO_VALVE_OPEN_RPM_MAX * 2
 
-    def _run(self, venting_mbar_seq, valve_open=False, ticks=0):
-        for venting, mbar in venting_mbar_seq:
-            valve_open, ticks = self.step(venting, mbar, valve_open, ticks)
+    def _run(self, venting_rpm_seq, valve_open=False, ticks=0):
+        for venting, rpm in venting_rpm_seq:
+            valve_open, ticks = self.step(venting, rpm, valve_open, ticks)
         return valve_open, ticks
 
     def test_single_glitch_does_not_open(self):
-        # one corrupted high sample amid vacuum readings: valve stays closed
-        seq = [(True, self.below)] * 5 + [(True, 999)] + [(True, self.below)] * 5
+        # one corrupted zero/garbage-low sample amid a still-spinning rotor: stays closed
+        seq = ([(True, self.rpm_unsafe)] * 5 + [(True, 0)]
+               + [(True, self.rpm_unsafe)] * 5)
         valve_open, ticks = self._run(seq)
         self.assertFalse(valve_open)
         self.assertEqual(ticks, 0)
 
     def test_repeated_isolated_glitches_do_not_open(self):
-        seq = [(True, self.below), (True, 999)] * (self.N * 3)
+        seq = [(True, self.rpm_unsafe), (True, 0)] * (self.N * 3)
         valve_open, _ = self._run(seq)
         self.assertFalse(valve_open)
 
     def test_opens_after_confirm_samples(self):
-        seq = [(True, self.above)] * self.N
+        seq = [(True, self.rpm_safe)] * self.N
         valve_open, _ = self._run(seq)
         self.assertTrue(valve_open)
 
     def test_does_not_open_one_sample_early(self):
-        seq = [(True, self.above)] * (self.N - 1)
+        seq = [(True, self.rpm_safe)] * (self.N - 1)
         valve_open, _ = self._run(seq)
         self.assertFalse(valve_open)
 
-    def test_below_threshold_resets_count(self):
-        seq = ([(True, self.above)] * (self.N - 1)
-               + [(True, self.below)]
-               + [(True, self.above)] * (self.N - 1))
+    def test_above_threshold_resets_count(self):
+        seq = ([(True, self.rpm_safe)] * (self.N - 1)
+               + [(True, self.rpm_unsafe)]
+               + [(True, self.rpm_safe)] * (self.N - 1))
         valve_open, _ = self._run(seq)
         self.assertFalse(valve_open)
 
     def test_never_opens_outside_venting(self):
-        seq = [(False, 999)] * (self.N * 2)
+        seq = [(False, 0)] * (self.N * 2)
         valve_open, ticks = self._run(seq)
         self.assertFalse(valve_open)
         self.assertEqual(ticks, 0)
 
-    def test_latches_open_despite_dips(self):
-        # once open, a dip below threshold must not chatter the relay
-        valve_open, ticks = self._run([(True, self.below)], valve_open=True)
+    def test_latches_open_despite_spikes(self):
+        # once open, a momentary RPM spike must not chatter the relay
+        valve_open, ticks = self._run([(True, self.rpm_unsafe)], valve_open=True)
         self.assertTrue(valve_open)
 
     def test_leaving_venting_closes_and_resets(self):
-        valve_open, ticks = self._run([(False, self.above)],
+        valve_open, ticks = self._run([(False, self.rpm_safe)],
                                       valve_open=True, ticks=self.N)
         self.assertFalse(valve_open)
         self.assertEqual(ticks, 0)
 
     def test_estop_mid_count_does_not_carry_into_next_vent(self):
-        # N-1 high reads, E-STOP to IDLE, vent again: one more high read
+        # N-1 safe reads, E-STOP to IDLE, vent again: one more safe read
         # must not be enough to open
-        seq = ([(True, self.above)] * (self.N - 1)
-               + [(False, self.below)]
-               + [(True, self.above)])
+        seq = ([(True, self.rpm_safe)] * (self.N - 1)
+               + [(False, self.rpm_unsafe)]
+               + [(True, self.rpm_safe)])
         valve_open, _ = self._run(seq)
         self.assertFalse(valve_open)
+
+    def test_exactly_at_threshold_counts_as_safe(self):
+        seq = [(True, config.TURBO_VALVE_OPEN_RPM_MAX)] * self.N
+        valve_open, _ = self._run(seq)
+        self.assertTrue(valve_open)
 
 
 # ════════════════════════════════════════════════════════
@@ -634,30 +637,30 @@ class TestFullProcessCycle(unittest.TestCase):
 
     def test_turbo_valve_latch_logic(self):
         """Drives the real GPIO22 valve rule (turbo_valve_step): closed
-        everywhere, latched open during VENTING only after a sustained
-        rise above threshold."""
+        everywhere, latched open during VENTING only after the turbo rotor
+        has sustained a drop to/below TURBO_VALVE_OPEN_RPM_MAX."""
         step = CAL["turbo_valve_step"]
         n = config.TURBO_VALVE_CONFIRM_SAMPLES
-        above = config.TURBO_VALVE_OPEN_MBAR * 2
-        below = config.TURBO_VALVE_OPEN_MBAR / 2
+        rpm_unsafe = config.TURBO_VALVE_OPEN_RPM_MAX * 2  # still spinning fast
+        rpm_safe   = config.TURBO_VALVE_OPEN_RPM_MAX / 2  # slow enough to open
 
-        # closed in all non-venting states regardless of pressure
+        # closed in all non-venting states regardless of rotor speed
         for state in ALL_STATES:
             if state == "VENTING":
                 continue
-            self.assertEqual(step(state == "VENTING", 999, False, 0),
+            self.assertEqual(step(state == "VENTING", rpm_safe, False, 0),
                              (False, 0))
-        # venting below threshold: still closed
-        self.assertEqual(step(True, below, False, 0), (False, 0))
-        # venting crosses threshold and stays there: opens, and latches
+        # venting, rotor still fast: still closed
+        self.assertEqual(step(True, rpm_unsafe, False, 0), (False, 0))
+        # venting, rotor sustains a drop to/below threshold: opens, and latches
         opened, ticks = False, 0
         for _ in range(n):
-            opened, ticks = step(True, above, opened, ticks)
+            opened, ticks = step(True, rpm_safe, opened, ticks)
         self.assertTrue(opened)
-        opened, _ = step(True, below, opened, 0)
-        self.assertTrue(opened, "latch must hold through noise dips")
+        opened, _ = step(True, rpm_unsafe, opened, 0)
+        self.assertTrue(opened, "latch must hold through noise spikes")
         # leaving venting: closes
-        self.assertEqual(step(False, 999, True, 0), (False, 0))
+        self.assertEqual(step(False, rpm_unsafe, True, 0), (False, 0))
 
 
 if __name__ == "__main__":

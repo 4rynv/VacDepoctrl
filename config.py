@@ -7,15 +7,18 @@ GPIO_PIRANI_PIN           = 17   # Input from Pirani gauge / control line for op
 GPIO_MFC_VALVE_CLOSE_PIN  = 27   # MFC valve close (emergency shut)
 GPIO_TURBO_VALVE_PIN      = 22   # Turbo inlet valve relay (BC547 driver, valve on NC
                                  # contact): GPIO HIGH = valve OPEN, LOW = valve CLOSED.
-                                 # Held closed at all times; opened only above
-                                 # TURBO_VALVE_OPEN_MBAR during VENTING.
+                                 # Held closed at all times; opened only at/below
+                                 # TURBO_VALVE_OPEN_RPM_MAX during VENTING.
                                  # (Was GPIO 4 / physical pin 7 — pad affected in the
                                  # early hardware issue along with GPIO 2/3. GPIO 22
                                  # = physical pin 15.)
-TURBO_VALVE_OPEN_MBAR     = 1.0  # During VENTING, open the turbo inlet valve once
-                                 # chamber pressure rises above this (latched until
-                                 # the state machine leaves VENTING)
-TURBO_VALVE_CONFIRM_SAMPLES = 3  # Consecutive polling reads above TURBO_VALVE_OPEN_MBAR
+TURBO_VALVE_OPEN_RPM_MAX  = 20000  # During VENTING, open the turbo inlet valve once
+                                 # turbo pump RPM (tach on ADC A2) drops to or below this
+                                 # speed (latched until the state machine leaves VENTING).
+                                 # Replaces the earlier pressure-based (mbar) trigger —
+                                 # RPM reflects rotor state directly instead of inferring
+                                 # it from chamber pressure.
+TURBO_VALVE_CONFIRM_SAMPLES = 3  # Consecutive polling reads at/below TURBO_VALVE_OPEN_RPM_MAX
                                  # required before the valve opens (3 × 0.2 s poll = 0.6 s).
                                  # A corrupted read on the software I2C bus (EMI bit-flips
                                  # return garbage without raising) must never open the valve.
