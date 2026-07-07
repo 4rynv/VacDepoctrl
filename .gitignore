@@ -1,3 +1,7 @@
+# Claude Code conversation exports — never publish
+20[0-9][0-9]-[0-9][0-9]-*.txt
+conversation-*.txt
+
 ### C ###
 
 # build files
