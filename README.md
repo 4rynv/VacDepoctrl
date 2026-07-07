@@ -7,7 +7,6 @@ A Raspberry Pi-based vacuum process controller for DC magnetron sputter depositi
 ## Table of Contents
 
 - [Hardware Overview](#hardware-overview)
-- [Hardware Notes (Hardware Notes)](#hardware-notes)
 - [Software Architecture](#software-architecture)
 - [File Structure](#file-structure)
 - [State Machine](#state-machine)
@@ -37,7 +36,7 @@ A Raspberry Pi-based vacuum process controller for DC magnetron sputter depositi
 
 ### I2C: Software Bus 3 on GPIO 23/24
 
-The Pi's hardware I2C pads (GPIO 2/3, physical pins 3/5) were affected in the early hardware issue (see below). I2C now runs as a **bit-banged software bus** via device-tree overlay in `/boot/firmware/config.txt`:
+I2C runs as a **bit-banged software bus** via device-tree overlay in `/boot/firmware/config.txt`:
 
 ```
 dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=24,i2c_gpio_delay_us=2
@@ -107,20 +106,6 @@ A 4N35's usable output current is roughly `CTR (~100%) × LED current (~10 mA ma
 | Inlet solenoid | ~50 mA @ 26V | No — relay contacts switch it |
 
 The turbo enable opto (GPIO 17) currently only works with excess LED drive; the proper fix is a BC547 buffer on its output (opto pin 5 → enable+, pin 4 → BC547 base, 10 kΩ base–emitter, BC547 C/E across the enable terminals). Flyback diodes go **in parallel across coils** (reverse-biased), never in series.
-
----
-
-## Hardware Notes (Hardware Notes)
-
-During valve wiring, the 26 V solenoid supply contacted the logic wiring around header pins 3–7. Notes — **do not use these pins**:
-
-| Pin | BCM | Was | Status |
-|---|---|---|---|
-| phys 3 | GPIO 2 (SDA) | hardware I2C | **not used — bypassed by software bus 3 |
-| phys 5 | GPIO 3 (SCL) | hardware I2C | **not used — bypassed by software bus 3 |
-| phys 7 | GPIO 4 | turbo inlet valve | **not used — moved to GPIO 22 |
-
-The original ADS1115 were affected during same event (replaced); the MCP4725 survived. Notes: 26 V wiring physically segregated from the logic breadboard (only relay contacts bridge the domains); series resistors into ADC inputs recommended (pending).
 
 ---
 
@@ -447,12 +432,11 @@ If you change `POLLING_INTERVAL`, expect to retune Kd and Ki — both depend on 
 
 ## Known Limitations
 
-- **Three dead GPIO pads** (GPIO 2, 3, 4) from the early hardware issue — see [Hardware Notes](#hardware-notes). Software I2C bus 3 and GPIO 22 are the workarounds; a replacement Pi would allow reverting to hardware I2C.
 - **Turbo enable opto (GPIO 17) is marginal**: the enable input draws ~15–30 mA, beyond a 4N35's ~10 mA saturated capability at legal GPIO LED drive. Currently only works with excess LED current. Proper fix (BC547 output buffer) designed but not yet installed.
 - **DAC ceiling at 3.3V**: MCP4725 powered from the Pi 3.3V rail, buffered through the LM358P for current but capped at 3.3V — commanded MFC flow limited to roughly 46% of full scale (~322 sccm) until a level-shifted 5V DAC path is added.
 - **MFC feedback (A1) scaling unverified**: the MKS 1179A feedback is 0–5V; whether A1 has a divider (and therefore what full-scale voltage means) has not been confirmed — displayed flow may be scaled wrong, and an undivided 5V input would over-stress the ADS1115.
 - **Argon PSI guard is honor-system**: the ≥15 psi check reads an operator-entered value, not a sensor, and the entered value persists across runs.
-- **No series protection resistors on ADC inputs yet** — recommended after general input protection.
+- **No series protection resistors on ADC inputs yet** — recommended as general input protection.
 - **`_ignite_plasma()` is a stub**: RF power supply trigger is not yet implemented.
 - **Pirani gauge readings may drift**: at atmosphere A0 has been observed at ~3.04V where the table expects ~3.3V — either partial vacuum at time of reading, or the divider ratio is slightly under 0.33. Not yet root-caused.
 

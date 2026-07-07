@@ -9,9 +9,7 @@ GPIO_TURBO_VALVE_PIN      = 22   # Turbo inlet valve relay (BC547 driver, valve 
                                  # contact): GPIO HIGH = valve OPEN, LOW = valve CLOSED.
                                  # Held closed at all times; opened only at/below
                                  # TURBO_VALVE_OPEN_RPM_MAX during VENTING.
-                                 # (Was GPIO 4 / physical pin 7 — pad affected in the
-                                 # early hardware issue along with GPIO 2/3. GPIO 22
-                                 # = physical pin 15.)
+                                 # Physical pin 15.
 TURBO_VALVE_OPEN_RPM_MAX  = 20000  # During VENTING, open the turbo inlet valve once
                                  # turbo pump RPM (tach on ADC A2) drops to or below this
                                  # speed (latched until the state machine leaves VENTING).
@@ -26,9 +24,8 @@ TURBO_VALVE_CONFIRM_SAMPLES = 3  # Consecutive polling reads at/below TURBO_VALV
 # ════════════════════════════════════════════════════════
 #  I2C BUS
 # ════════════════════════════════════════════════════════
-I2C_BUS_NUMBER = 3   # 1 = hardware I2C (GPIO2/3, physical pins 3/5) — configured
-                     # by early hardware issue. 3 = software i2c-gpio on GPIO23/24
-                     # (physical pins 16/18), enabled via dtoverlay in /boot/firmware/config.txt
+I2C_BUS_NUMBER = 3   # software i2c-gpio on GPIO23/24 (physical pins 16/18),
+                     # enabled via dtoverlay in /boot/firmware/config.txt
 
 # ════════════════════════════════════════════════════════
 #  ADC CONFIGURATION

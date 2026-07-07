@@ -59,7 +59,7 @@ class TestConfigSanity(unittest.TestCase):
         self.assertEqual(len(pins), len(set(pins)), "GPIO pin collision")
 
     def test_pins_avoid_dead_pads(self):
-        # GPIO 2, 3, 4 were affected during early hardware issue; GPIO 23/24 are the I2C bus
+        # GPIO 2/3/4 are non-functional on this board; 23/24 are reserved for the I2C bus
         forbidden = {2, 3, 4, 23, 24}
         for pin in (config.GPIO_PIRANI_PIN,
                     config.GPIO_MFC_VALVE_CLOSE_PIN,
