@@ -15,6 +15,10 @@ GPIO_TURBO_VALVE_PIN      = 22   # Turbo inlet valve relay (BC547 driver, valve 
 TURBO_VALVE_OPEN_MBAR     = 0.01 # During VENTING, open the turbo inlet valve once
                                  # chamber pressure rises above this (latched until
                                  # the state machine leaves VENTING)
+TURBO_VALVE_CONFIRM_SAMPLES = 3  # Consecutive polling reads above TURBO_VALVE_OPEN_MBAR
+                                 # required before the valve opens (3 × 0.2 s poll = 0.6 s).
+                                 # A corrupted read on the software I2C bus (EMI bit-flips
+                                 # return garbage without raising) must never open the valve.
 
 # ════════════════════════════════════════════════════════
 #  I2C BUS

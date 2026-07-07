@@ -90,6 +90,13 @@ class TestConfigSanity(unittest.TestCase):
         self.assertGreater(config.TURBO_VALVE_OPEN_MBAR, 0.0)
         self.assertLess(config.TURBO_VALVE_OPEN_MBAR, 1.0)
 
+    def test_turbo_valve_confirm_samples(self):
+        # >= 2 or a single corrupted I2C read can open the valve
+        self.assertGreaterEqual(config.TURBO_VALVE_CONFIRM_SAMPLES, 2)
+        # keep the open delay under 2 s at the configured polling rate
+        self.assertLessEqual(
+            config.TURBO_VALVE_CONFIRM_SAMPLES * config.POLLING_INTERVAL, 2.0)
+
 
 # ════════════════════════════════════════════════════════
 #  Pirani calibration interpolation (from main.py source)
@@ -139,6 +146,80 @@ class TestCalibration(unittest.TestCase):
         # 0.01 mbar should sit near 0.512 V ADC per the datasheet table
         self.assertAlmostEqual(mbar_to_v(config.TURBO_VALVE_OPEN_MBAR),
                                0.5115, places=3)
+
+
+# ════════════════════════════════════════════════════════
+#  Turbo valve debounced latch (from main.py source)
+# ════════════════════════════════════════════════════════
+class TestTurboValveStep(unittest.TestCase):
+    """The valve must never open on readings that don't stay above
+    TURBO_VALVE_OPEN_MBAR for TURBO_VALVE_CONFIRM_SAMPLES consecutive polls."""
+
+    def setUp(self):
+        self.step = CAL["turbo_valve_step"]
+        self.N = config.TURBO_VALVE_CONFIRM_SAMPLES
+        self.above = config.TURBO_VALVE_OPEN_MBAR * 2
+        self.below = config.TURBO_VALVE_OPEN_MBAR / 2
+
+    def _run(self, venting_mbar_seq, valve_open=False, ticks=0):
+        for venting, mbar in venting_mbar_seq:
+            valve_open, ticks = self.step(venting, mbar, valve_open, ticks)
+        return valve_open, ticks
+
+    def test_single_glitch_does_not_open(self):
+        # one corrupted high sample amid vacuum readings: valve stays closed
+        seq = [(True, self.below)] * 5 + [(True, 999)] + [(True, self.below)] * 5
+        valve_open, ticks = self._run(seq)
+        self.assertFalse(valve_open)
+        self.assertEqual(ticks, 0)
+
+    def test_repeated_isolated_glitches_do_not_open(self):
+        seq = [(True, self.below), (True, 999)] * (self.N * 3)
+        valve_open, _ = self._run(seq)
+        self.assertFalse(valve_open)
+
+    def test_opens_after_confirm_samples(self):
+        seq = [(True, self.above)] * self.N
+        valve_open, _ = self._run(seq)
+        self.assertTrue(valve_open)
+
+    def test_does_not_open_one_sample_early(self):
+        seq = [(True, self.above)] * (self.N - 1)
+        valve_open, _ = self._run(seq)
+        self.assertFalse(valve_open)
+
+    def test_below_threshold_resets_count(self):
+        seq = ([(True, self.above)] * (self.N - 1)
+               + [(True, self.below)]
+               + [(True, self.above)] * (self.N - 1))
+        valve_open, _ = self._run(seq)
+        self.assertFalse(valve_open)
+
+    def test_never_opens_outside_venting(self):
+        seq = [(False, 999)] * (self.N * 2)
+        valve_open, ticks = self._run(seq)
+        self.assertFalse(valve_open)
+        self.assertEqual(ticks, 0)
+
+    def test_latches_open_despite_dips(self):
+        # once open, a dip below threshold must not chatter the relay
+        valve_open, ticks = self._run([(True, self.below)], valve_open=True)
+        self.assertTrue(valve_open)
+
+    def test_leaving_venting_closes_and_resets(self):
+        valve_open, ticks = self._run([(False, self.above)],
+                                      valve_open=True, ticks=self.N)
+        self.assertFalse(valve_open)
+        self.assertEqual(ticks, 0)
+
+    def test_estop_mid_count_does_not_carry_into_next_vent(self):
+        # N-1 high reads, E-STOP to IDLE, vent again: one more high read
+        # must not be enough to open
+        seq = ([(True, self.above)] * (self.N - 1)
+               + [(False, self.below)]
+               + [(True, self.above)])
+        valve_open, _ = self._run(seq)
+        self.assertFalse(valve_open)
 
 
 # ════════════════════════════════════════════════════════
@@ -516,29 +597,29 @@ class TestFullProcessCycle(unittest.TestCase):
                                    "SPUTTERING", "VENTING", "IDLE"])
 
     def test_turbo_valve_latch_logic(self):
-        """Replicates the GPIO22 valve rule from _poll(): closed everywhere,
-        latched open above threshold during VENTING only."""
-        def valve_should_open(state, mbar, currently_open):
-            if state == "VENTING":
-                if not currently_open and mbar > config.TURBO_VALVE_OPEN_MBAR:
-                    return True
-                return currently_open
-            return False
+        """Drives the real GPIO22 valve rule (turbo_valve_step): closed
+        everywhere, latched open during VENTING only after a sustained
+        rise above threshold."""
+        step = CAL["turbo_valve_step"]
+        n = config.TURBO_VALVE_CONFIRM_SAMPLES
 
         # closed in all non-venting states regardless of pressure
         for state in ALL_STATES:
             if state == "VENTING":
                 continue
-            self.assertFalse(valve_should_open(state, 999, False))
+            self.assertEqual(step(state == "VENTING", 999, False, 0),
+                             (False, 0))
         # venting below threshold: still closed
-        self.assertFalse(valve_should_open("VENTING", 0.005, False))
-        # venting crosses threshold: opens, and latches
-        opened = valve_should_open("VENTING", 0.02, False)
+        self.assertEqual(step(True, 0.005, False, 0), (False, 0))
+        # venting crosses threshold and stays there: opens, and latches
+        opened, ticks = False, 0
+        for _ in range(n):
+            opened, ticks = step(True, 0.02, opened, ticks)
         self.assertTrue(opened)
-        self.assertTrue(valve_should_open("VENTING", 0.005, opened),
-                        "latch must hold through noise dips")
+        opened, _ = step(True, 0.005, opened, 0)
+        self.assertTrue(opened, "latch must hold through noise dips")
         # leaving venting: closes
-        self.assertFalse(valve_should_open("IDLE", 999, True))
+        self.assertEqual(step(False, 999, True, 0), (False, 0))
 
 
 if __name__ == "__main__":

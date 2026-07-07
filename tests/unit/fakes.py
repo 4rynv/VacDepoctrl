@@ -174,9 +174,13 @@ def install():
 # ────────────────────────────────────────────────────────
 def load_calibration(repo_root):
     import math, os
+    import config
     src = open(os.path.join(repo_root, "main.py")).read()
     start = src.index("_PIRANI_CAL = [")
     end = src.index("from pirani")
-    ns = {"math": math}
+    # turbo_valve_step references these config globals at call time
+    ns = {"math": math,
+          "TURBO_VALVE_OPEN_MBAR": config.TURBO_VALVE_OPEN_MBAR,
+          "TURBO_VALVE_CONFIRM_SAMPLES": config.TURBO_VALVE_CONFIRM_SAMPLES}
     exec(src[start:end], ns)
     return ns

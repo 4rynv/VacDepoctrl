@@ -91,6 +91,27 @@ def adc_voltage_to_mbar(voltage):
             return math.exp(math.log(p_lo) + t * (math.log(p_hi) - math.log(p_lo)))
     return cal[-1][0]
 
+def turbo_valve_step(venting, mbar, valve_open, above_ticks):
+    """Debounced turbo inlet valve latch. Pure decision logic — no I/O.
+
+    The valve may only open during VENTING, and only after
+    TURBO_VALVE_CONFIRM_SAMPLES consecutive readings above
+    TURBO_VALVE_OPEN_MBAR: a single corrupted read on the software I2C
+    bus (EMI bit-flips return garbage without raising) must not latch
+    the valve open. A below-threshold reading resets the count. Once
+    open, the valve stays latched open (no relay chatter) until VENTING
+    is left; leaving VENTING also clears the count so a partial count
+    can't carry into the next vent. Returns (valve_open, above_ticks).
+    """
+    if not venting:
+        return False, 0
+    if valve_open:
+        return True, 0
+    if mbar > TURBO_VALVE_OPEN_MBAR:
+        above_ticks += 1
+        return above_ticks >= TURBO_VALVE_CONFIRM_SAMPLES, above_ticks
+    return False, 0
+
 from pirani        import PiraniController
 from mfc_control   import MFCController
 from state_machine import SputterStateMachine, STATE_COLORS
@@ -233,7 +254,8 @@ def _on_confirm_plasma():
 _stop_event = threading.Event()
 
 def _poll():
-    turbo_valve_open = False  # GPIO 4 driven LOW (valve closed) during hardware init
+    turbo_valve_open = False  # Pin driven LOW (valve closed) during hardware init
+    turbo_above_ticks = 0     # Consecutive VENTING reads above TURBO_VALVE_OPEN_MBAR
     while not _stop_event.is_set():
         start_time = time.time()  # Track start time for precise loop interval timing
         try:
@@ -314,18 +336,17 @@ def _poll():
                 p = pirani.read(auto_opto=True)
                 mfc.valve_release()
 
-            # Turbo inlet valve (GPIO 4): held CLOSED (LOW) at all times, except
-            # latched OPEN (HIGH) once pressure rises above TURBO_VALVE_OPEN_MBAR
-            # while VENTING. Latching (rather than level-comparing every tick)
-            # prevents relay chatter from ADC noise around the threshold.
+            # Turbo inlet valve: held CLOSED (LOW) at all times, except latched
+            # OPEN (HIGH) during VENTING after TURBO_VALVE_CONFIRM_SAMPLES
+            # consecutive reads above TURBO_VALVE_OPEN_MBAR (see turbo_valve_step).
             # Re-closed automatically on leaving VENTING.
-            if current == "VENTING":
-                if not turbo_valve_open and adc_voltage_to_mbar(p["voltage"]) > TURBO_VALVE_OPEN_MBAR:
-                    GPIO.output(GPIO_TURBO_VALVE_PIN, GPIO.HIGH)
-                    turbo_valve_open = True
-            elif turbo_valve_open:
-                GPIO.output(GPIO_TURBO_VALVE_PIN, GPIO.LOW)
-                turbo_valve_open = False
+            was_open = turbo_valve_open
+            turbo_valve_open, turbo_above_ticks = turbo_valve_step(
+                current == "VENTING", adc_voltage_to_mbar(p["voltage"]),
+                turbo_valve_open, turbo_above_ticks)
+            if turbo_valve_open != was_open:
+                GPIO.output(GPIO_TURBO_VALVE_PIN,
+                            GPIO.HIGH if turbo_valve_open else GPIO.LOW)
 
             m = mfc.read()
 
