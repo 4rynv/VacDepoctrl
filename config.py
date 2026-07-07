@@ -12,7 +12,7 @@ GPIO_TURBO_VALVE_PIN      = 22   # Turbo inlet valve relay (BC547 driver, valve 
                                  # (Was GPIO 4 / physical pin 7 — pad affected in the
                                  # early hardware issue along with GPIO 2/3. GPIO 22
                                  # = physical pin 15.)
-TURBO_VALVE_OPEN_MBAR     = 0.01 # During VENTING, open the turbo inlet valve once
+TURBO_VALVE_OPEN_MBAR     = 1.0  # During VENTING, open the turbo inlet valve once
                                  # chamber pressure rises above this (latched until
                                  # the state machine leaves VENTING)
 TURBO_VALVE_CONFIRM_SAMPLES = 3  # Consecutive polling reads above TURBO_VALVE_OPEN_MBAR
@@ -34,8 +34,15 @@ ADC_VREF  = 3.33      # Reference voltage (volts)
 ADC_GAIN  = 1         # ADS1115 gain setting
 
 # ADC Channel Assignment
-ADC_CHANNEL_PIRANI = 0   # Pirani gauge on A0
-ADC_CHANNEL_MFC    = 1   # MFC flow on A1
+ADC_CHANNEL_PIRANI    = 0   # Pirani gauge on A0
+ADC_CHANNEL_MFC       = 1   # MFC flow on A1
+ADC_CHANNEL_TURBO_RPM = 2   # Turbo pump RPM tach output on A2
+
+# ════════════════════════════════════════════════════════
+#  TURBO PUMP RPM (tach output on ADC A2)
+# ════════════════════════════════════════════════════════
+TURBO_RPM_VOLTAGE_FULL_SCALE = 3.3      # Volts at A2 for full-scale RPM
+TURBO_RPM_FULL_SCALE         = 90000.0  # RPM at TURBO_RPM_VOLTAGE_FULL_SCALE
 
 # ════════════════════════════════════════════════════════
 #  MFC CONTROLLER PARAMETERS

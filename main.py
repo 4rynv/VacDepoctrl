@@ -114,6 +114,7 @@ def turbo_valve_step(venting, mbar, valve_open, above_ticks):
 
 from pirani        import PiraniController
 from mfc_control   import MFCController
+from turbo_rpm     import TurboRPMController
 from state_machine import SputterStateMachine, STATE_COLORS
 from graph         import ScrollingGraph
 
@@ -133,9 +134,10 @@ i2c = ExtendedI2C(I2C_BUS_NUMBER)
 ads = ADS.ADS1115(i2c, address=ADS1115_I2C_ADDRESS)
 ads.gain = ADC_GAIN
 
-pirani = PiraniController(ads)
-mfc    = MFCController(ads, i2c=i2c)
-sm     = SputterStateMachine()
+pirani    = PiraniController(ads)
+mfc       = MFCController(ads, i2c=i2c)
+turbo_rpm = TurboRPMController(ads)
+sm        = SputterStateMachine()
 
 def handle_hardware_interlocks(old_state, new_state):
     """Executes instantaneous safety overrides on the main thread when states shift."""
@@ -191,6 +193,9 @@ _state = {
 
     "flow_target":     0.0,
     "turbo_valve_open": False,
+    "turbo_rpm_adc":   0,
+    "turbo_rpm_voltage": 0.0,
+    "turbo_rpm":       0.0,
     "argon_pressure":  0.0,
     "sputter_target_mbar": 0.007,  # default 0.007 mbar
     "plasma_ignition_start": None,
@@ -349,6 +354,7 @@ def _poll():
                             GPIO.HIGH if turbo_valve_open else GPIO.LOW)
 
             m = mfc.read()
+            r = turbo_rpm.read()  # Display only; read every tick regardless of state
 
             # Pass the raw ADC counts into the state machine to satisfy the atmosphere transition rule
             sm.update(p["voltage"], pirani_adc=p["adc"], opto_enabled=p["opto_enabled"])
@@ -367,6 +373,9 @@ def _poll():
                     "dac_code":         m.get("dac_code", 0),
                     "flow_target":      m.get("flow_target", 0.0),
                     "turbo_valve_open": turbo_valve_open,
+                    "turbo_rpm_adc":    r["adc"],
+                    "turbo_rpm_voltage": r["voltage"],
+                    "turbo_rpm":        r["rpm"],
                     "sm_state":         sm.state,
                 })
 
@@ -487,16 +496,18 @@ lbl_p_volt     = tk.Label(pf, text="Voltage : ——.—— V", font=("Courier",
 lbl_p_mbar     = tk.Label(pf, text="Pressure: ——.—— mbar", font=("Courier", 12, "bold"), anchor="w", width=32)
 lbl_opto       = tk.Label(pf, text="OPTO    : ——",      font=("Courier", 14, "bold"), anchor="w", width=32)
 lbl_tvalve     = tk.Label(pf, text="T-VALVE : ——",      font=("Courier", 14, "bold"), anchor="w", width=32)
+lbl_turbo_rpm  = tk.Label(pf, text="T-RPM   : ——.—— RPM", font=("Courier", 12), anchor="w", width=32)
 lbl_p_message  = tk.Label(pf, text="",               font=("Courier", 10), anchor="w", width=80, fg="blue")
 lbl_p_adc .grid(row=0, sticky="w")
 lbl_p_volt.grid(row=1, sticky="w")
 lbl_p_mbar.grid(row=2, sticky="w")
 lbl_opto  .grid(row=3, sticky="w", pady=(6, 0))
 lbl_tvalve.grid(row=4, sticky="w")
-lbl_p_message.grid(row=5, sticky="w", pady=(6, 0))
+lbl_turbo_rpm.grid(row=5, sticky="w")
+lbl_p_message.grid(row=6, sticky="w", pady=(6, 0))
 
 p_canvas = tk.Canvas(pf, height=90, bg="#1a1a1a", highlightthickness=0)
-p_canvas.grid(row=6, column=0, sticky="ew", pady=(6, 2))
+p_canvas.grid(row=7, column=0, sticky="ew", pady=(6, 2))
 pf.columnconfigure(0, weight=1)
 
 p_graph = ScrollingGraph(p_canvas, maxlen=GRAPH_MAX_SAMPLES,
@@ -669,6 +680,7 @@ def _refresh():
         text = "T-VALVE : OPEN (venting)" if s["turbo_valve_open"] else "T-VALVE : CLOSED",
         fg   = "orange"                   if s["turbo_valve_open"] else "green",
     )
+    lbl_turbo_rpm.config(text=f"T-RPM   : {s['turbo_rpm']:.0f} RPM")
 
     if st == "IDLE":
         p_message = "IDLE: MFC valve closed, turbo opto off."

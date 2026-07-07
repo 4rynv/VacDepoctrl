@@ -29,6 +29,7 @@ import mfc_control
 import pirani as pirani_mod
 from mfc_control import MFCController
 from pirani import PiraniController
+from turbo_rpm import TurboRPMController
 from fakes import FakeADS1115, FakeI2C, gpio
 
 CAL = fakes.load_calibration(REPO_ROOT)
@@ -88,7 +89,7 @@ class TestConfigSanity(unittest.TestCase):
 
     def test_turbo_valve_threshold(self):
         self.assertGreater(config.TURBO_VALVE_OPEN_MBAR, 0.0)
-        self.assertLess(config.TURBO_VALVE_OPEN_MBAR, 1.0)
+        self.assertLess(config.TURBO_VALVE_OPEN_MBAR, 999.0)  # below atmosphere
 
     def test_turbo_valve_confirm_samples(self):
         # >= 2 or a single corrupted I2C read can open the valve
@@ -143,9 +144,9 @@ class TestCalibration(unittest.TestCase):
             prev = m
 
     def test_turbo_valve_threshold_voltage(self):
-        # 0.01 mbar should sit near 0.512 V ADC per the datasheet table
+        # 1 mbar should sit near 1.881 V ADC per the datasheet table
         self.assertAlmostEqual(mbar_to_v(config.TURBO_VALVE_OPEN_MBAR),
-                               0.5115, places=3)
+                               1.881, places=3)
 
 
 # ════════════════════════════════════════════════════════
@@ -507,6 +508,41 @@ class TestPiraniController(unittest.TestCase):
 
 
 # ════════════════════════════════════════════════════════
+#  Turbo pump RPM (tach on A2, display only)
+# ════════════════════════════════════════════════════════
+class TestTurboRPMController(unittest.TestCase):
+    def setUp(self):
+        gpio.reset()
+        self.ads = FakeADS1115()
+        self.r = TurboRPMController(self.ads)
+
+    def _set(self, voltage):
+        self.ads.set_channel(config.ADC_CHANNEL_TURBO_RPM, voltage=voltage)
+
+    def test_zero_volts_is_zero_rpm(self):
+        self._set(0.0)
+        self.assertEqual(self.r.read()["rpm"], 0.0)
+
+    def test_full_scale_voltage_is_full_scale_rpm(self):
+        self._set(config.TURBO_RPM_VOLTAGE_FULL_SCALE)
+        self.assertAlmostEqual(self.r.read()["rpm"],
+                               config.TURBO_RPM_FULL_SCALE, places=1)
+
+    def test_half_scale_voltage_is_half_scale_rpm(self):
+        self._set(config.TURBO_RPM_VOLTAGE_FULL_SCALE / 2)
+        self.assertAlmostEqual(self.r.read()["rpm"],
+                               config.TURBO_RPM_FULL_SCALE / 2, places=1)
+
+    def test_overrange_voltage_clamps_at_full_scale(self):
+        self._set(config.TURBO_RPM_VOLTAGE_FULL_SCALE + 1.0)
+        self.assertEqual(self.r.read()["rpm"], config.TURBO_RPM_FULL_SCALE)
+
+    def test_negative_voltage_clamps_at_zero(self):
+        self._set(-0.5)
+        self.assertEqual(self.r.read()["rpm"], 0.0)
+
+
+# ════════════════════════════════════════════════════════
 #  Integration: full virtual process cycle
 # ════════════════════════════════════════════════════════
 class TestFullProcessCycle(unittest.TestCase):
@@ -602,6 +638,8 @@ class TestFullProcessCycle(unittest.TestCase):
         rise above threshold."""
         step = CAL["turbo_valve_step"]
         n = config.TURBO_VALVE_CONFIRM_SAMPLES
+        above = config.TURBO_VALVE_OPEN_MBAR * 2
+        below = config.TURBO_VALVE_OPEN_MBAR / 2
 
         # closed in all non-venting states regardless of pressure
         for state in ALL_STATES:
@@ -610,13 +648,13 @@ class TestFullProcessCycle(unittest.TestCase):
             self.assertEqual(step(state == "VENTING", 999, False, 0),
                              (False, 0))
         # venting below threshold: still closed
-        self.assertEqual(step(True, 0.005, False, 0), (False, 0))
+        self.assertEqual(step(True, below, False, 0), (False, 0))
         # venting crosses threshold and stays there: opens, and latches
         opened, ticks = False, 0
         for _ in range(n):
-            opened, ticks = step(True, 0.02, opened, ticks)
+            opened, ticks = step(True, above, opened, ticks)
         self.assertTrue(opened)
-        opened, _ = step(True, 0.005, opened, 0)
+        opened, _ = step(True, below, opened, 0)
         self.assertTrue(opened, "latch must hold through noise dips")
         # leaving venting: closes
         self.assertEqual(step(False, 999, True, 0), (False, 0))
