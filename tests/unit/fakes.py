@@ -129,6 +129,45 @@ class FakeI2C:
 
 
 # ────────────────────────────────────────────────────────
+#  Fake pyserial (PZEMController's transport)
+# ────────────────────────────────────────────────────────
+class FakeSerial:
+    """Stand-in for serial.Serial. Records every write() frame in `.writes`;
+    tests queue canned response bytes in `.responses` (one entry consumed
+    per read() call; an empty queue returns b"", simulating a timeout).
+    Constructing with a port name listed in FAIL_PORTS raises OSError, so
+    tests can simulate "meter not plugged in" without touching real hardware.
+    """
+
+    FAIL_PORTS = set()
+
+    def __init__(self, port, baudrate=9600, bytesize=8, parity="N",
+                 stopbits=1, timeout=None):
+        if port in FakeSerial.FAIL_PORTS:
+            raise OSError(f"[Errno 2] could not open port {port}")
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.writes = []
+        self.responses = []
+        self.closed = False
+
+    def reset_input_buffer(self):
+        pass
+
+    def write(self, data):
+        self.writes.append(bytes(data))
+
+    def read(self, n):
+        if not self.responses:
+            return b""
+        return self.responses.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+# ────────────────────────────────────────────────────────
 #  Module installation
 # ────────────────────────────────────────────────────────
 gpio = FakeGPIOModule()   # single shared instance, reset() between tests
@@ -166,21 +205,44 @@ def install():
     busio.I2C = lambda scl, sda: FakeI2C()
     sys.modules["busio"] = busio
 
+    fake_serial = types.ModuleType("serial")
+    fake_serial.Serial = FakeSerial
+    fake_serial.EIGHTBITS = 8
+    fake_serial.PARITY_NONE = "N"
+    fake_serial.STOPBITS_ONE = 1
+    sys.modules["serial"] = fake_serial
+
 
 # ────────────────────────────────────────────────────────
 #  Calibration loader — pulls the table + both interpolation
 #  functions out of main.py WITHOUT importing it (main.py
 #  starts hardware + the GUI at import time).
 # ────────────────────────────────────────────────────────
-def load_calibration(repo_root):
+def load_main_slice(repo_root, overrides=None):
+    """Like load_calibration, but lets a test override specific config
+    constants before exec -- e.g. to feed config_sanity_failures() a
+    hypothetical bad config. Each call re-execs into a fresh namespace, so
+    overrides never leak between tests (unlike mutating the shared
+    load_calibration() result: a function's free-variable lookups go
+    through its *original* __globals__, not a copy of that dict, so
+    patching a dict copy silently has no effect on the function at all).
+    """
     import math, os
     import config
     src = open(os.path.join(repo_root, "main.py")).read()
     start = src.index("_PIRANI_CAL = [")
     end = src.index("from pirani")
-    # turbo_valve_step references these config globals at call time
-    ns = {"math": math,
-          "TURBO_VALVE_OPEN_RPM_MAX": config.TURBO_VALVE_OPEN_RPM_MAX,
-          "TURBO_VALVE_CONFIRM_SAMPLES": config.TURBO_VALVE_CONFIRM_SAMPLES}
+    # turbo_valve_step / cross-sensor / global-gate functions in this slice
+    # reference config globals at call time -- inject every constant
+    # (config.py holds nothing but ALL_CAPS constants) so new ones don't
+    # need to be listed here by hand.
+    ns = {"math": math}
+    ns.update({k: v for k, v in vars(config).items() if k.isupper()})
+    if overrides:
+        ns.update(overrides)
     exec(src[start:end], ns)
     return ns
+
+
+def load_calibration(repo_root):
+    return load_main_slice(repo_root)

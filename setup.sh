@@ -20,7 +20,8 @@ echo "==> Installing Python packages..."
 "$SCRIPT_DIR/venv/bin/python" -m pip install \
 				adafruit-blinka \
 				adafruit-circuitpython-ads1x15 \
-				RPi.GPIO
+				RPi.GPIO \
+				pyserial
 # # ── 4. Fix alias in ~/.bashrc ─────────────────
 echo "==> Updating source_sputt alias in ~/.bashrc..."
 ALIAS_LINE="alias source_sputt='source $SCRIPT_DIR/venv/bin/activate'"
@@ -39,6 +40,7 @@ echo "==> Verifying installation..."
 "$SCRIPT_DIR/venv/bin/python" -c "import board; print('    board        OK')"
 "$SCRIPT_DIR/venv/bin/python" -c "import adafruit_ads1x15; print('    ADS1115       OK')"
 "$SCRIPT_DIR/venv/bin/python" -c "import RPi.GPIO; print('    RPi.GPIO      OK')"
+"$SCRIPT_DIR/venv/bin/python" -c "import serial; print('    pyserial      OK')"
 
 echo ""
 echo "==> Setup complete."

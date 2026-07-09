@@ -2,7 +2,6 @@
 
 import threading
 from config import (
-    VENTING_COMPLETE_VOLTAGE,
     IDLE_PRESSURE_MAX_VOLTAGE,
     PUMP_DOWN_COMPLETE_VOLTAGE,
 )
@@ -20,15 +19,18 @@ VALID_TRANSITIONS = {
 }
 
 # ── GUI colors per state ──────────────────────────────
+# Hex codes, not X11 names, for the less-universal ones (some Tk builds --
+# e.g. macOS's old bundled Tk 8.5 -- don't ship the extended X11 color-name
+# table; "grey"/"green" are basic/always-safe, left as names for readability).
 STATE_COLORS = {
     "IDLE":            "grey",
-    "PUMP_DOWN":       "orange",
+    "PUMP_DOWN":       "#FFA500",  # orange
     "READY":           "green",
-    "ARGON_FLUSH":     "magenta",
-    "PLASMA_IGNITING": "purple",
-    "SPUTTER_READY":   "turquoise",
-    "SPUTTERING":      "cyan",
-    "VENTING":         "orange",
+    "ARGON_FLUSH":     "#FF00FF",  # magenta
+    "PLASMA_IGNITING": "#800080",  # purple
+    "SPUTTER_READY":   "#40E0D0",  # turquoise
+    "SPUTTERING":      "#00FFFF",  # cyan
+    "VENTING":         "#FFA500",  # orange
 }
 
 
@@ -85,9 +87,16 @@ class SputterStateMachine:
         Automatic sensor-driven transitions. Evaluated continuously by the hardware polling thread.
 
         Note: ARGON_FLUSH -> PLASMA_IGNITING is owned exclusively by _poll() in
-        main.py (it arms the ignition timeout and fires _ignite_plasma()), and
-        PLASMA_IGNITING -> SPUTTER_READY is operator-only via Confirm Plasma —
-        neither transition may be duplicated here.
+        main.py (it arms the ignition timeout and fires _ignite_plasma()),
+        PLASMA_IGNITING -> SPUTTER_READY is operator-only via Confirm Plasma
+        (or the operator-armed PZEM Auto-Confirm path, also in _poll()), and
+        VENTING -> IDLE is owned exclusively by _poll() (gated on the operator
+        confirming the primary/roughing pump is off, via vent_complete_ready()
+        — reaching atmospheric pressure alone is not enough: the turbo inlet
+        valve closes the instant this state is left, per turbo_valve_step(),
+        and that must not happen before the operator has had a chance to
+        physically switch off the primary pump) — none of these three may be
+        duplicated here.
         """
         with self._lock:
             old_state = self._state
@@ -103,11 +112,6 @@ class SputterStateMachine:
                 if pirani_voltage >= IDLE_PRESSURE_MAX_VOLTAGE:
                     # Pressure degraded (e.g. leak); drop back into pump-down
                     self._state = "PUMP_DOWN"
-
-            elif self._state == "VENTING":
-                # Transition to IDLE once Pirani reads atmospheric pressure
-                if pirani_voltage >= VENTING_COMPLETE_VOLTAGE:
-                    self._state = "IDLE"
 
             # If an automatic transition occurred, broadcast it to the hardware hook
             if old_state != self._state and self.on_transition_callback:

@@ -30,7 +30,9 @@ import pirani as pirani_mod
 from mfc_control import MFCController
 from pirani import PiraniController
 from turbo_rpm import TurboRPMController
-from fakes import FakeADS1115, FakeI2C, gpio
+from pzem_meter import PZEMController
+from sim_hardware import ChamberSim
+from fakes import FakeADS1115, FakeI2C, FakeSerial, gpio
 
 CAL = fakes.load_calibration(REPO_ROOT)
 mbar_to_v = CAL["mbar_to_adc_voltage"]
@@ -45,12 +47,21 @@ ALL_STATES = list(VALID_TRANSITIONS.keys())
 # ════════════════════════════════════════════════════════
 class TestConfigSanity(unittest.TestCase):
     def test_pressure_thresholds_ordered(self):
+        # Increasing voltage = increasing pressure: deep vacuum (PUMP_DOWN
+        # complete) < flush target < safe pump-down-start ceiling < atmosphere
+        # (VENTING complete, must be the highest — it's a real pressure, not
+        # a vacuum gate)
         self.assertLess(config.PUMP_DOWN_COMPLETE_VOLTAGE,
                         config.ARGON_FLUSH_TARGET_VOLTAGE)
         self.assertLess(config.ARGON_FLUSH_TARGET_VOLTAGE,
-                        config.VENTING_COMPLETE_VOLTAGE)
-        self.assertLess(config.VENTING_COMPLETE_VOLTAGE,
                         config.IDLE_PRESSURE_MAX_VOLTAGE)
+        self.assertLess(config.IDLE_PRESSURE_MAX_VOLTAGE,
+                        config.VENTING_COMPLETE_VOLTAGE)
+
+    def test_venting_complete_near_atmosphere(self):
+        # Must represent real atmosphere, not a partial vacuum (the bug this
+        # guards against: VENTING_COMPLETE_VOLTAGE was 2.5V, only ~5 mbar)
+        self.assertGreaterEqual(v_to_mbar(config.VENTING_COMPLETE_VOLTAGE), 100)
 
     def test_gpio_pins_distinct(self):
         pins = [config.GPIO_PIRANI_PIN,
@@ -97,6 +108,34 @@ class TestConfigSanity(unittest.TestCase):
         # keep the open delay under 2 s at the configured polling rate
         self.assertLessEqual(
             config.TURBO_VALVE_CONFIRM_SAMPLES * config.POLLING_INTERVAL, 2.0)
+
+    def test_turbo_rpm_stall_threshold_in_range(self):
+        self.assertGreater(config.TURBO_RPM_STALL_THRESHOLD, 0.0)
+        self.assertLess(config.TURBO_RPM_STALL_THRESHOLD, config.TURBO_RPM_FULL_SCALE)
+
+    def test_venting_pump_off_prompt_below_stall_threshold(self):
+        # The venting prompt is an operator cue for "nearly stopped", not a
+        # fault threshold -- it should fire at a lower RPM than the fault-
+        # detection bar, not above/equal to it.
+        self.assertGreater(config.VENTING_PUMP_OFF_PROMPT_RPM, 0.0)
+        self.assertLess(config.VENTING_PUMP_OFF_PROMPT_RPM,
+                        config.TURBO_RPM_STALL_THRESHOLD)
+
+    def test_dac_saturation_thresholds_sane(self):
+        self.assertGreater(config.DAC_SATURATION_MARGIN_V, 0.0)
+        self.assertLess(config.DAC_SATURATION_MARGIN_V, config.ARGON_DAC_VREF)
+        self.assertGreater(config.DAC_SATURATION_FLOW_FRACTION, 0.0)
+        self.assertLessEqual(config.DAC_SATURATION_FLOW_FRACTION, 1.0)
+
+    def test_pzem_plasma_hysteresis_ordered(self):
+        self.assertLess(config.PZEM_PLASMA_CURRENT_OFF_A, config.PZEM_PLASMA_CURRENT_ON_A)
+
+    def test_pzem_confirm_samples_sane(self):
+        # >= 2 or a single Modbus CRC glitch could flip plasma_detected
+        self.assertGreaterEqual(config.PZEM_PLASMA_CONFIRM_SAMPLES, 2)
+
+    def test_pzem_frequency_band_sane(self):
+        self.assertLess(config.PZEM_FREQUENCY_MIN, config.PZEM_FREQUENCY_MAX)
 
 
 # ════════════════════════════════════════════════════════
@@ -227,6 +266,581 @@ class TestTurboValveStep(unittest.TestCase):
 
 
 # ════════════════════════════════════════════════════════
+#  Cross-sensor consistency checks (from main.py source)
+# ════════════════════════════════════════════════════════
+T0 = 1_700_000_000.0  # arbitrary fixed epoch so tests don't depend on wall clock
+
+
+class TestTurboSpinupCheck(unittest.TestCase):
+    def setUp(self):
+        self.check = CAL["turbo_spinup_check"]
+        self.grace = config.TURBO_SPINUP_GRACE_SECONDS
+        self.stall_rpm = config.TURBO_RPM_STALL_THRESHOLD / 2
+        self.spinning_rpm = config.TURBO_RPM_STALL_THRESHOLD * 10
+
+    def test_opto_off_never_flags(self):
+        flagged, since = self.check(False, 0, None, T0)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+    def test_spinning_normally_never_flags(self):
+        flagged, since = self.check(True, self.spinning_rpm, T0, T0 + self.grace * 10)
+        self.assertFalse(flagged)
+
+    def test_does_not_flag_before_grace_elapses(self):
+        flagged, since = self.check(True, self.stall_rpm, T0, T0 + self.grace - 1)
+        self.assertFalse(flagged)
+
+    def test_flags_after_grace_elapses_while_stalled(self):
+        flagged, since = self.check(True, self.stall_rpm, T0, T0 + self.grace)
+        self.assertTrue(flagged)
+
+    def test_on_since_latched_from_first_tick_opto_turned_on(self):
+        _, since = self.check(True, self.stall_rpm, None, T0)
+        self.assertEqual(since, T0)
+        # a later tick must not reset the clock while opto stays on
+        _, since2 = self.check(True, self.stall_rpm, since, T0 + 1)
+        self.assertEqual(since2, T0)
+
+    def test_opto_turning_off_resets_clock(self):
+        flagged, since = self.check(False, self.stall_rpm, T0, T0 + self.grace)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+
+class TestTurboRpmDropCheck(unittest.TestCase):
+    """Distinct from turbo_spinup_check: catches a healthy turbo losing
+    speed later, not just a turbo that never spun up."""
+
+    def setUp(self):
+        self.check = CAL["turbo_rpm_drop_check"]
+        self.grace = config.TURBO_RPM_DROP_GRACE_SECONDS
+        self.healthy_rpm = config.TURBO_RPM_STALL_THRESHOLD * 2
+        self.dropped_rpm = config.TURBO_RPM_STALL_THRESHOLD / 2
+
+    def test_opto_off_never_flags_and_resets(self):
+        flagged, healthy, since = self.check(False, 0, True, T0, T0 + self.grace)
+        self.assertFalse(flagged)
+        self.assertFalse(healthy)
+        self.assertIsNone(since)
+
+    def test_never_confirmed_healthy_never_flags(self):
+        # low RPM before ever crossing the stall threshold is turbo_spinup_check's
+        # job, not this one's -- must not flag here even past the grace period
+        flagged, healthy, since = self.check(True, self.dropped_rpm, False, T0, T0 + self.grace * 10)
+        self.assertFalse(flagged)
+        self.assertFalse(healthy)
+
+    def test_crossing_threshold_confirms_healthy_and_never_flags(self):
+        flagged, healthy, since = self.check(True, self.healthy_rpm, False, None, T0)
+        self.assertFalse(flagged)
+        self.assertTrue(healthy)
+        self.assertIsNone(since)
+
+    def test_does_not_flag_before_grace_elapses(self):
+        flagged, healthy, since = self.check(
+            True, self.dropped_rpm, True, T0, T0 + self.grace - 1)
+        self.assertFalse(flagged)
+
+    def test_flags_after_grace_elapses_while_dropped(self):
+        flagged, healthy, since = self.check(
+            True, self.dropped_rpm, True, T0, T0 + self.grace)
+        self.assertTrue(flagged)
+
+    def test_recovering_above_threshold_resets_clock(self):
+        flagged, healthy, since = self.check(
+            True, self.healthy_rpm, True, T0, T0 + self.grace)
+        self.assertFalse(flagged)
+        self.assertTrue(healthy)
+        self.assertIsNone(since)
+
+    def test_dropped_since_latched_from_first_drop_tick(self):
+        _, _, since = self.check(True, self.dropped_rpm, True, None, T0)
+        self.assertEqual(since, T0)
+        _, _, since2 = self.check(True, self.dropped_rpm, True, since, T0 + 1)
+        self.assertEqual(since2, T0)
+
+
+class TestMfcFlowCheck(unittest.TestCase):
+    def setUp(self):
+        self.check = CAL["mfc_flow_check"]
+        self.grace = config.MFC_FLOW_GRACE_SECONDS
+        self.commanded = config.MFC_FLOW_MIN_COMMANDED_SCCM * 5
+
+    def test_small_commanded_flow_never_flags(self):
+        # below MFC_FLOW_MIN_COMMANDED_SCCM: PID settling noise near zero, not a fault
+        tiny = config.MFC_FLOW_MIN_COMMANDED_SCCM / 2
+        flagged, since = self.check(tiny, 0.0, T0, T0 + self.grace * 10)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+    def test_responding_normally_never_flags(self):
+        flagged, since = self.check(self.commanded, self.commanded * 0.9, None, T0)
+        self.assertFalse(flagged)
+
+    def test_does_not_flag_before_grace_elapses(self):
+        flagged, since = self.check(self.commanded, 0.0, T0, T0 + self.grace - 1)
+        self.assertFalse(flagged)
+
+    def test_flags_after_grace_elapses_while_stalled(self):
+        flagged, since = self.check(self.commanded, 0.0, T0, T0 + self.grace)
+        self.assertTrue(flagged)
+
+    def test_recovering_resets_clock(self):
+        flagged, since = self.check(self.commanded, self.commanded * 0.9, T0, T0 + self.grace)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+
+class TestDacSaturationFlowCheck(unittest.TestCase):
+    """DAC pegged at its ceiling while flow doesn't respond -- a stronger
+    fault signal than mfc_flow_check's target/measured mismatch."""
+
+    def setUp(self):
+        self.check = CAL["dac_saturation_flow_check"]
+        self.grace = config.DAC_SATURATION_GRACE_SECONDS
+        self.ceiling = config.ARGON_DAC_VREF
+        self.responding_flow = config.MFC_FULL_SCALE * config.DAC_SATURATION_FLOW_FRACTION * 1.5
+        self.stalled_flow = config.MFC_FULL_SCALE * config.DAC_SATURATION_FLOW_FRACTION * 0.1
+
+    def test_not_saturated_never_flags(self):
+        mid_voltage = self.ceiling / 2
+        flagged, since = self.check(mid_voltage, 0.0, T0, T0 + self.grace * 10)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+    def test_saturated_and_responding_never_flags(self):
+        flagged, since = self.check(self.ceiling, self.responding_flow, None, T0)
+        self.assertFalse(flagged)
+
+    def test_within_margin_of_ceiling_counts_as_saturated(self):
+        near_ceiling = self.ceiling - config.DAC_SATURATION_MARGIN_V / 2
+        flagged, since = self.check(near_ceiling, self.stalled_flow, T0, T0 + self.grace)
+        self.assertTrue(flagged)
+
+    def test_does_not_flag_before_grace_elapses(self):
+        flagged, since = self.check(self.ceiling, self.stalled_flow, T0, T0 + self.grace - 1)
+        self.assertFalse(flagged)
+
+    def test_flags_after_grace_elapses_while_stalled(self):
+        flagged, since = self.check(self.ceiling, self.stalled_flow, T0, T0 + self.grace)
+        self.assertTrue(flagged)
+
+    def test_recovering_resets_clock(self):
+        flagged, since = self.check(self.ceiling, self.responding_flow, T0, T0 + self.grace)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+
+class TestPressureConvergenceCheck(unittest.TestCase):
+    def setUp(self):
+        self.check = CAL["pressure_convergence_check"]
+        self.grace = config.PRESSURE_CONVERGENCE_GRACE_SECONDS
+        self.tol = config.PRESSURE_CONVERGENCE_TOLERANCE_V
+
+    def test_within_tolerance_never_flags(self):
+        flagged, since = self.check(1.287, 1.287 + self.tol / 2, T0, T0 + self.grace * 10)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+    def test_does_not_flag_before_grace_elapses(self):
+        flagged, since = self.check(1.287, 1.287 + self.tol * 2, T0, T0 + self.grace - 1)
+        self.assertFalse(flagged)
+
+    def test_flags_after_grace_elapses_while_diverging(self):
+        flagged, since = self.check(1.287, 1.287 + self.tol * 2, T0, T0 + self.grace)
+        self.assertTrue(flagged)
+
+    def test_converging_resets_clock(self):
+        flagged, since = self.check(1.287, 1.287 + self.tol / 2, T0, T0 + self.grace)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+    def test_symmetric_over_under_shoot(self):
+        # error is |current - target|; overshoot must flag the same as undershoot
+        flagged_over, _ = self.check(1.287 + self.tol * 2, 1.287, T0, T0 + self.grace)
+        flagged_under, _ = self.check(1.287 - self.tol * 2, 1.287, T0, T0 + self.grace)
+        self.assertTrue(flagged_over)
+        self.assertTrue(flagged_under)
+
+
+class TestSensorRangeCheck(unittest.TestCase):
+    """Global gate: physically impossible ADC-derived voltages (disconnected/
+    shorted/miswired sensor), debounced like every other hardware check here."""
+
+    def setUp(self):
+        self.check = CAL["sensor_range_check"]
+        self.N = config.SENSOR_RANGE_CONFIRM_SAMPLES
+        self.sane = (1.2, 0.5, 2.0)
+        self.insane = (config.SANE_VOLTAGE_MAX * 3, 0.5, 2.0)
+
+    def test_sane_readings_never_flag(self):
+        bad_ticks = 0
+        for _ in range(self.N * 3):
+            flagged, bad_ticks = self.check(self.sane, bad_ticks)
+        self.assertFalse(flagged)
+
+    def test_below_min_flags_after_confirm_samples(self):
+        below_min = (config.SANE_VOLTAGE_MIN - 1.0, 0.5, 2.0)
+        bad_ticks = 0
+        for _ in range(self.N):
+            flagged, bad_ticks = self.check(below_min, bad_ticks)
+        self.assertTrue(flagged)
+
+    def test_above_max_flags_after_confirm_samples(self):
+        bad_ticks = 0
+        for _ in range(self.N):
+            flagged, bad_ticks = self.check(self.insane, bad_ticks)
+        self.assertTrue(flagged)
+
+    def test_does_not_flag_one_sample_early(self):
+        bad_ticks = 0
+        for _ in range(self.N - 1):
+            flagged, bad_ticks = self.check(self.insane, bad_ticks)
+        self.assertFalse(flagged)
+
+    def test_single_glitch_does_not_flag(self):
+        # one corrupted reading amid sane ones must not trip the gate
+        flagged, bad_ticks = False, 0
+        seq = [self.sane] * 5 + [self.insane] + [self.sane] * 5
+        for voltages in seq:
+            flagged, bad_ticks = self.check(voltages, bad_ticks)
+        self.assertFalse(flagged)
+
+    def test_recovering_resets_count(self):
+        bad_ticks = 0
+        for _ in range(self.N - 1):
+            _, bad_ticks = self.check(self.insane, bad_ticks)
+        flagged, bad_ticks = self.check(self.sane, bad_ticks)
+        self.assertFalse(flagged)
+        self.assertEqual(bad_ticks, 0)
+
+
+class TestPlasmaDetectStep(unittest.TestCase):
+    """Hysteresis + debounce latch for PZEM current-draw plasma detection
+    (from main.py source) -- same shape as the turbo opto ON/OFF hysteresis
+    and the turbo valve confirm-samples debounce, combined."""
+
+    def setUp(self):
+        self.step = CAL["plasma_detect_step"]
+        self.on_a = config.PZEM_PLASMA_CURRENT_ON_A
+        self.off_a = config.PZEM_PLASMA_CURRENT_OFF_A
+        self.N = config.PZEM_PLASMA_CONFIRM_SAMPLES
+
+    def _run(self, currents, detected=False, ticks=0):
+        for a in currents:
+            detected, ticks = self.step(a, detected, ticks)
+        return detected, ticks
+
+    def test_below_off_never_detects(self):
+        detected, _ = self._run([self.off_a - 0.01] * (self.N * 3))
+        self.assertFalse(detected)
+
+    def test_detects_after_confirm_samples_at_on(self):
+        detected, _ = self._run([self.on_a] * self.N)
+        self.assertTrue(detected)
+
+    def test_does_not_detect_one_sample_early(self):
+        detected, _ = self._run([self.on_a] * (self.N - 1))
+        self.assertFalse(detected)
+
+    def test_single_glitch_does_not_detect(self):
+        seq = [self.off_a] * 5 + [self.on_a] + [self.off_a] * 5
+        detected, _ = self._run(seq)
+        self.assertFalse(detected)
+
+    def test_dip_into_dead_band_resets_confirm_count(self):
+        mid = (self.on_a + self.off_a) / 2
+        seq = [self.on_a] * (self.N - 1) + [mid] + [self.on_a] * (self.N - 1)
+        detected, _ = self._run(seq)
+        self.assertFalse(detected)
+
+    def test_falls_immediately_below_off_threshold(self):
+        detected, ticks = self._run([self.on_a] * self.N)
+        self.assertTrue(detected)
+        detected, ticks = self.step(self.off_a, detected, ticks)
+        self.assertFalse(detected)
+
+    def test_latches_through_dead_band_once_detected(self):
+        detected, ticks = self._run([self.on_a] * self.N)
+        mid = (self.on_a + self.off_a) / 2
+        detected, ticks = self.step(mid, detected, ticks)
+        self.assertTrue(detected, "dead band must hold the latched state")
+
+    def test_exactly_at_on_threshold_counts(self):
+        detected, _ = self._run([self.on_a] * self.N)
+        self.assertTrue(detected)
+
+    def test_exactly_at_off_threshold_clears(self):
+        detected, ticks = self._run([self.on_a] * self.N)
+        detected, _ = self.step(self.off_a, detected, ticks)
+        self.assertFalse(detected)
+
+
+class TestPzemPlasmaAbsentCheck(unittest.TestCase):
+    """SPUTTER_READY/SPUTTERING assume plasma is already lit; PLASMA_IGNITING
+    is deliberately excluded (owned by PLASMA_IGNITION_TIMEOUT instead)."""
+
+    def setUp(self):
+        self.check = CAL["pzem_plasma_absent_check"]
+        self.grace = config.PZEM_PLASMA_ABSENT_GRACE_SECONDS
+
+    def test_plasma_igniting_never_flags(self):
+        flagged, since = self.check("PLASMA_IGNITING", False, T0, T0 + self.grace * 10)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+    def test_non_plasma_states_never_flag(self):
+        for state in ("IDLE", "PUMP_DOWN", "READY", "ARGON_FLUSH", "VENTING"):
+            flagged, since = self.check(state, False, T0, T0 + self.grace * 10)
+            self.assertFalse(flagged, f"{state} must not flag")
+
+    def test_detected_never_flags(self):
+        flagged, since = self.check("SPUTTERING", True, None, T0)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+    def test_does_not_flag_before_grace_elapses(self):
+        flagged, since = self.check("SPUTTER_READY", False, T0, T0 + self.grace - 1)
+        self.assertFalse(flagged)
+
+    def test_flags_after_grace_elapses(self):
+        flagged, since = self.check("SPUTTER_READY", False, T0, T0 + self.grace)
+        self.assertTrue(flagged)
+
+    def test_both_expected_states_covered(self):
+        for state in ("SPUTTER_READY", "SPUTTERING"):
+            flagged, since = self.check(state, False, T0, T0 + self.grace)
+            self.assertTrue(flagged, f"{state} must flag when plasma absent")
+
+    def test_recovering_resets_clock(self):
+        flagged, since = self.check("SPUTTERING", True, T0, T0 + self.grace)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+
+class TestPzemPowerUnexpectedCheck(unittest.TestCase):
+    """Plasma-level current draw while nowhere near attempting ignition —
+    stuck relay, live supply, or wiring fault."""
+
+    def setUp(self):
+        self.check = CAL["pzem_power_unexpected_check"]
+        self.grace = config.PZEM_POWER_UNEXPECTED_GRACE_SECONDS
+
+    def test_expected_states_never_flag(self):
+        for state in ("PLASMA_IGNITING", "SPUTTER_READY", "SPUTTERING"):
+            flagged, since = self.check(state, True, T0, T0 + self.grace * 10)
+            self.assertFalse(flagged, f"{state} must not flag")
+
+    def test_not_detected_never_flags(self):
+        flagged, since = self.check("IDLE", False, None, T0)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+    def test_does_not_flag_before_grace_elapses(self):
+        flagged, since = self.check("READY", True, T0, T0 + self.grace - 1)
+        self.assertFalse(flagged)
+
+    def test_flags_after_grace_elapses(self):
+        flagged, since = self.check("READY", True, T0, T0 + self.grace)
+        self.assertTrue(flagged)
+
+    def test_all_unexpected_states_covered(self):
+        for state in ("IDLE", "PUMP_DOWN", "READY", "ARGON_FLUSH", "VENTING"):
+            flagged, since = self.check(state, True, T0, T0 + self.grace)
+            self.assertTrue(flagged, f"{state} must flag on unexpected power")
+
+    def test_recovering_resets_clock(self):
+        flagged, since = self.check("IDLE", False, T0, T0 + self.grace)
+        self.assertFalse(flagged)
+        self.assertIsNone(since)
+
+
+# ════════════════════════════════════════════════════════
+#  Vent-complete confirmation gate (from main.py source)
+# ════════════════════════════════════════════════════════
+class TestVentCompleteReady(unittest.TestCase):
+    """VENTING -> IDLE requires BOTH atmospheric pressure AND explicit
+    operator confirmation the primary/roughing pump is off -- pressure
+    alone must never be enough (that let the turbo inlet valve reclose
+    before the operator could react)."""
+
+    def setUp(self):
+        self.ready = CAL["vent_complete_ready"]
+
+    def test_below_atmosphere_never_ready_even_if_confirmed(self):
+        self.assertFalse(self.ready(config.VENTING_COMPLETE_VOLTAGE - 0.1, True))
+
+    def test_at_atmosphere_not_ready_without_confirmation(self):
+        self.assertFalse(self.ready(config.VENTING_COMPLETE_VOLTAGE, False))
+
+    def test_above_atmosphere_not_ready_without_confirmation(self):
+        self.assertFalse(self.ready(config.VENTING_COMPLETE_VOLTAGE + 1.0, False))
+
+    def test_at_atmosphere_and_confirmed_is_ready(self):
+        self.assertTrue(self.ready(config.VENTING_COMPLETE_VOLTAGE, True))
+
+    def test_above_atmosphere_and_confirmed_is_ready(self):
+        self.assertTrue(self.ready(config.VENTING_COMPLETE_VOLTAGE + 1.0, True))
+
+    def test_confirmed_alone_without_atmosphere_not_ready(self):
+        self.assertFalse(self.ready(0.0, True))
+
+
+# ════════════════════════════════════════════════════════
+#  PZEM energy meter driver (Modbus-RTU over a fake serial port)
+# ════════════════════════════════════════════════════════
+def _crc16(data):
+    """Independent Modbus CRC16 implementation used only to build test
+    fixtures -- deliberately not shared with pzem_meter's own _crc16_modbus
+    so a bug in that implementation wouldn't silently pass here too."""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc
+
+
+def _pzem_response_frame(slave_addr, regs):
+    payload = bytes([slave_addr, 0x04, len(regs) * 2])
+    for r in regs:
+        payload += bytes([(r >> 8) & 0xFF, r & 0xFF])
+    crc = _crc16(payload)
+    return payload + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+
+# voltage=230.1V, current=1.234A, power=326.5W, energy=12345Wh, freq=50.0Hz, pf=0.98, no alarm
+_SAMPLE_REGS = [2301, 1234, 0, 3265, 0, 12345, 0, 500, 98, 0]
+
+
+class TestPZEMController(unittest.TestCase):
+    def setUp(self):
+        FakeSerial.FAIL_PORTS = set()
+
+    def tearDown(self):
+        FakeSerial.FAIL_PORTS = set()
+
+    def test_port_unavailable_is_not_ready_and_does_not_raise(self):
+        FakeSerial.FAIL_PORTS = {"/dev/does-not-exist"}
+        ctrl = PZEMController(port="/dev/does-not-exist")
+        self.assertFalse(ctrl.ready)
+        reading = ctrl.read()   # must not raise
+        self.assertFalse(reading["ready"])
+        self.assertEqual(reading["current"], 0.0)
+
+    def test_valid_response_decodes_all_fields(self):
+        ctrl = PZEMController(port="/dev/fake0")
+        ctrl._ser.responses.append(_pzem_response_frame(ctrl.slave_addr, _SAMPLE_REGS))
+        r = ctrl.read()
+        self.assertTrue(r["ready"])
+        self.assertAlmostEqual(r["voltage"], 230.1, places=3)
+        self.assertAlmostEqual(r["current"], 1.234, places=3)
+        self.assertAlmostEqual(r["power"], 326.5, places=3)
+        self.assertEqual(r["energy"], 12345.0)
+        self.assertAlmostEqual(r["frequency"], 50.0, places=3)
+        self.assertAlmostEqual(r["power_factor"], 0.98, places=3)
+        self.assertFalse(r["alarm"])
+        self.assertTrue(ctrl.ready)
+
+    def test_request_frame_is_well_formed(self):
+        ctrl = PZEMController(port="/dev/fake0")
+        ctrl._ser.responses.append(_pzem_response_frame(ctrl.slave_addr, _SAMPLE_REGS))
+        ctrl.read()
+        frame = ctrl._ser.writes[-1]
+        self.assertEqual(frame[0], ctrl.slave_addr)
+        self.assertEqual(frame[1], 0x04)
+        self.assertEqual(frame[2:6], bytes([0x00, 0x00, 0x00, 0x0A]))
+        self.assertEqual(_crc16(frame[:-2]), frame[-2] | (frame[-1] << 8))
+
+    def test_timeout_is_not_ready_and_does_not_raise(self):
+        ctrl = PZEMController(port="/dev/fake0")
+        # no response queued -> FakeSerial.read() returns b"", simulating a timeout
+        r = ctrl.read()
+        self.assertFalse(r["ready"])
+        self.assertEqual(r["voltage"], 0.0)
+
+    def test_crc_mismatch_is_not_ready(self):
+        ctrl = PZEMController(port="/dev/fake0")
+        corrupt = bytearray(_pzem_response_frame(ctrl.slave_addr, _SAMPLE_REGS))
+        corrupt[-1] ^= 0xFF
+        ctrl._ser.responses.append(bytes(corrupt))
+        r = ctrl.read()
+        self.assertFalse(r["ready"])
+
+    def test_bad_response_drops_connection_for_next_read(self):
+        ctrl = PZEMController(port="/dev/fake0")
+        ctrl._ser.responses.append(b"\x00\x01")   # too short to be a valid frame
+        r = ctrl.read()
+        self.assertFalse(r["ready"])
+        self.assertIsNone(ctrl._ser, "must drop the connection so the next read() reopens it")
+
+    def test_recovers_once_the_meter_is_plugged_in(self):
+        FakeSerial.FAIL_PORTS = {"/dev/fake0"}
+        ctrl = PZEMController(port="/dev/fake0")
+        self.assertIsNone(ctrl._ser)
+        self.assertFalse(ctrl.read()["ready"])
+
+        FakeSerial.FAIL_PORTS = set()   # "device plugged in"
+        ctrl._open()
+        ctrl._ser.responses.append(_pzem_response_frame(ctrl.slave_addr, _SAMPLE_REGS))
+        r = ctrl.read()
+        self.assertTrue(r["ready"])
+
+
+class TestConfigSanityFailures(unittest.TestCase):
+    """Pure runtime self-test logic (config_sanity_failures) -- must agree
+    with the real config.py (no failures) and must actually catch the
+    exact bug class it exists to prevent (thresholds out of order)."""
+
+    def setUp(self):
+        self.check = CAL["config_sanity_failures"]
+
+    def test_real_config_has_no_failures(self):
+        self.assertEqual(self.check(), [])
+
+    def test_catches_venting_threshold_regression(self):
+        # Replicates the actual historical bug: VENTING_COMPLETE_VOLTAGE
+        # below IDLE_PRESSURE_MAX_VOLTAGE instead of above it.
+        bad_ns = fakes.load_main_slice(REPO_ROOT, overrides={
+            "VENTING_COMPLETE_VOLTAGE": config.IDLE_PRESSURE_MAX_VOLTAGE - 0.1,
+        })
+        failures = bad_ns["config_sanity_failures"]()
+        self.assertTrue(any("order" in f for f in failures))
+
+    def test_catches_gpio_pin_collision(self):
+        bad_ns = fakes.load_main_slice(REPO_ROOT, overrides={
+            "GPIO_MFC_VALVE_CLOSE_PIN": config.GPIO_TURBO_VALVE_PIN,
+        })
+        failures = bad_ns["config_sanity_failures"]()
+        self.assertTrue(any("collision" in f for f in failures))
+
+    def test_catches_dead_pad_reuse(self):
+        bad_ns = fakes.load_main_slice(REPO_ROOT, overrides={
+            "GPIO_TURBO_VALVE_PIN": 4,  # dead pad from the 26V incident
+        })
+        failures = bad_ns["config_sanity_failures"]()
+        self.assertTrue(any("dead/reserved" in f for f in failures))
+
+    def test_catches_rpm_threshold_out_of_range(self):
+        bad_ns = fakes.load_main_slice(REPO_ROOT, overrides={
+            "TURBO_VALVE_OPEN_RPM_MAX": config.TURBO_RPM_FULL_SCALE * 2,
+        })
+        failures = bad_ns["config_sanity_failures"]()
+        self.assertTrue(any("TURBO_VALVE_OPEN_RPM_MAX" in f for f in failures))
+
+    def test_catches_pzem_hysteresis_inversion(self):
+        bad_ns = fakes.load_main_slice(REPO_ROOT, overrides={
+            "PZEM_PLASMA_CURRENT_OFF_A": config.PZEM_PLASMA_CURRENT_ON_A + 1.0,
+        })
+        failures = bad_ns["config_sanity_failures"]()
+        self.assertTrue(any("PZEM_PLASMA_CURRENT_OFF_A" in f for f in failures))
+
+
+# ════════════════════════════════════════════════════════
 #  State machine
 # ════════════════════════════════════════════════════════
 class TestStateMachine(unittest.TestCase):
@@ -283,12 +897,21 @@ class TestStateMachine(unittest.TestCase):
                              f"auto-confirmed plasma at {v}V!")
         self.assertTrue(self.sm.transition("SPUTTER_READY"))
 
-    def test_venting_completes_at_atmosphere(self):
+    def test_venting_has_no_auto_complete(self):
+        """VENTING -> IDLE is owned exclusively by _poll(), gated on operator
+        confirmation that the primary/roughing pump is off (see
+        vent_complete_ready() in main.py) -- reaching atmospheric pressure
+        alone must never auto-complete it via sm.update(), the same
+        reasoning as test_argon_flush_has_no_auto_ignition and
+        test_plasma_confirm_is_operator_only."""
         self._force("VENTING")
-        self.sm.update(2.4)
-        self.assertEqual(self.sm.state, "VENTING")
-        self.sm.update(2.6)
-        self.assertEqual(self.sm.state, "IDLE")
+        for v in (config.VENTING_COMPLETE_VOLTAGE - 0.1,
+                  config.VENTING_COMPLETE_VOLTAGE,
+                  config.VENTING_COMPLETE_VOLTAGE + 1.0):
+            self.sm.update(v)
+            self.assertEqual(self.sm.state, "VENTING",
+                             f"auto-completed vent at {v}V!")
+        self.assertTrue(self.sm.transition("IDLE"))
 
     def test_estop_from_every_state(self):
         for state in ALL_STATES:
@@ -625,7 +1248,8 @@ class TestFullProcessCycle(unittest.TestCase):
         for _ in range(200):
             pressure = min(pressure * 2.0, 999.0)
             sm.update(v())
-            if sm.state == "IDLE":
+            if v() >= config.VENTING_COMPLETE_VOLTAGE:
+                sm.transition("IDLE")   # _poll() + operator confirmation own this in real code
                 break
         note()
         self.assertEqual(sm.state, "IDLE")
@@ -661,6 +1285,126 @@ class TestFullProcessCycle(unittest.TestCase):
         self.assertTrue(opened, "latch must hold through noise spikes")
         # leaving venting: closes
         self.assertEqual(step(False, rpm_unsafe, True, 0), (False, 0))
+
+
+# ════════════════════════════════════════════════════════
+#  Simulation mode (sim_hardware.ChamberSim) — the physics model behind
+#  SPUTTER_SIM=1, tested in isolation from install()'s sys.modules
+#  injection (which would clobber the fakes.install() state every other
+#  test in this file depends on).
+# ════════════════════════════════════════════════════════
+class TestChamberSim(unittest.TestCase):
+    def setUp(self):
+        self.chamber = ChamberSim()
+
+    def _run(self, seconds, dt=0.2):
+        n = int(seconds / dt)
+        for _ in range(n):
+            self.chamber.step(dt)
+
+    def test_starts_at_atmosphere_no_spin(self):
+        self.assertAlmostEqual(self.chamber.pirani_v, 3.3, places=3)
+        self.assertEqual(self.chamber.turbo_rpm, 0.0)
+
+    def test_turbo_ramps_up_when_enabled(self):
+        self.chamber.set_turbo_enabled(True)
+        self._run(5.0)
+        self.assertGreater(self.chamber.turbo_rpm, 0.0)
+
+    def test_turbo_ramps_down_when_disabled(self):
+        self.chamber.set_turbo_enabled(True)
+        self._run(10.0)
+        spun_up = self.chamber.turbo_rpm
+        self.assertGreater(spun_up, 0.0)
+        self.chamber.set_turbo_enabled(False)
+        self._run(10.0)
+        self.assertLess(self.chamber.turbo_rpm, spun_up)
+
+    def test_turbo_never_exceeds_full_scale(self):
+        self.chamber.set_turbo_enabled(True)
+        self._run(120.0)
+        self.assertLessEqual(self.chamber.turbo_rpm, config.TURBO_RPM_FULL_SCALE)
+
+    def test_pressure_falls_while_pumping_with_valve_closed(self):
+        self.chamber.set_turbo_enabled(True)
+        self._run(20.0)
+        self.assertLess(self.chamber.pirani_v, 3.3)
+
+    def test_pressure_rises_toward_atmosphere_when_valve_open(self):
+        self.chamber.set_turbo_enabled(True)
+        self._run(20.0)
+        low_point = self.chamber.pirani_v
+        self.chamber.set_turbo_valve(True)
+        self._run(10.0)
+        self.assertGreater(self.chamber.pirani_v, low_point)
+
+    def test_pressure_never_leaves_sane_bounds(self):
+        self.chamber.set_turbo_enabled(True)
+        self.chamber.set_mfc_flow(config.MFC_FULL_SCALE)
+        self._run(120.0)
+        self.assertGreaterEqual(self.chamber.pirani_v, 0.0)
+        self.assertLessEqual(self.chamber.pirani_v, 3.3)
+
+    def test_mfc_flow_chases_commanded(self):
+        self.chamber.set_mfc_flow(200.0)
+        self._run(3.0)
+        self.assertGreater(self.chamber.mfc_flow, 100.0)
+        self.assertLessEqual(self.chamber.mfc_flow, 200.0 + 1e-6)
+
+    def test_mfc_v_reflects_measured_flow(self):
+        self.chamber.set_mfc_flow(config.MFC_FULL_SCALE)
+        self._run(5.0)
+        self.assertGreater(self.chamber.mfc_v, 0.0)
+        self.assertLessEqual(self.chamber.mfc_v, config.ADC_VREF + 1e-6)
+
+    def test_turbo_v_reflects_rpm(self):
+        self.chamber.set_turbo_enabled(True)
+        self._run(60.0)
+        self.assertAlmostEqual(
+            self.chamber.turbo_v,
+            self.chamber.turbo_rpm / config.TURBO_RPM_FULL_SCALE * config.TURBO_RPM_VOLTAGE_FULL_SCALE,
+            places=6)
+
+    def test_plasma_current_idle_by_default(self):
+        self._run(5.0)
+        self.assertLess(self.chamber.pzem_current, config.PZEM_PLASMA_CURRENT_ON_A)
+
+    def test_plasma_strike_is_manual_not_automatic(self):
+        # A flow+low-pressure heuristic was tried first, but it fired
+        # during ARGON_FLUSH itself since the PID legitimately drives flow
+        # and pressure into the same ballpark while just converging on the
+        # flush target -- well before any real ignition attempt. Even with
+        # flow commanded at a deposition-relevant low pressure, sustained
+        # for a while, the simulated variac must stay off until the
+        # operator explicitly says otherwise.
+        self.chamber.set_turbo_enabled(True)
+        self.chamber.turbo_rpm = config.TURBO_RPM_FULL_SCALE
+        self.chamber.pirani_v = 1.0
+        self.chamber.set_mfc_flow(150.0)
+        self._run(30.0)
+        self.assertLess(self.chamber.pzem_current, config.PZEM_PLASMA_CURRENT_ON_A)
+
+    def test_set_plasma_struck_true_raises_current(self):
+        self.chamber.set_plasma_struck(True)
+        self._run(1.0)
+        self.assertGreaterEqual(self.chamber.pzem_current, config.PZEM_PLASMA_CURRENT_ON_A)
+
+    def test_set_plasma_struck_false_clears_current(self):
+        self.chamber.set_plasma_struck(True)
+        self._run(1.0)
+        self.assertGreaterEqual(self.chamber.pzem_current, config.PZEM_PLASMA_CURRENT_ON_A)
+        self.chamber.set_plasma_struck(False)
+        self._run(1.0)
+        self.assertLess(self.chamber.pzem_current, config.PZEM_PLASMA_CURRENT_ON_A)
+
+    def test_plasma_struck_persists_regardless_of_flow_or_pressure(self):
+        # Manual control means manual -- nothing about flow/pressure
+        # dynamics should clear it once the operator has set it.
+        self.chamber.set_plasma_struck(True)
+        self.chamber.set_mfc_flow(0.0)
+        self.chamber.pirani_v = 3.3
+        self._run(5.0)
+        self.assertGreaterEqual(self.chamber.pzem_current, config.PZEM_PLASMA_CURRENT_ON_A)
 
 
 if __name__ == "__main__":

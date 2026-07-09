@@ -63,12 +63,10 @@ class MFCController:
     def set_flow(self, sccm):
         """Set the argon MFC flow target via the DAC.
 
-        The MFC wants 0–5V for 0–MFC_FULL_SCALE sccm. The MCP4725 here is powered
-        off the Pi's 3.3V rail (no level shifter), so it can only physically put out
-        0–ARGON_DAC_VREF volts. We compute the voltage the MFC actually needs, then
-        clamp to what the DAC can deliver — until a level-shift/scaling circuit is
-        added, commanded flow above (ARGON_DAC_VREF / MFC_SETPOINT_VOLTAGE_FULL_SCALE)
-        * MFC_FULL_SCALE will be capped at that ceiling.
+        The MFC wants 0–5V for 0–MFC_FULL_SCALE sccm. An op-amp stage
+        level-shifts the DAC output up to that full range (ARGON_DAC_VREF
+        reflects this), so the clamp below is just a safety ceiling at the
+        DAC's actual max, not a routine cap on commanded flow.
         """
         self.flow_target = max(0.0, min(float(sccm), MFC_FULL_SCALE))
 
