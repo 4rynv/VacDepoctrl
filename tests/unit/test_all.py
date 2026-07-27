@@ -32,6 +32,7 @@ from pirani import PiraniController
 from turbo_rpm import TurboRPMController
 from pzem_meter import PZEMController
 from sim_hardware import ChamberSim
+from web_ui import WebUI
 from fakes import FakeADS1115, FakeI2C, FakeSerial, gpio
 
 CAL = fakes.load_calibration(REPO_ROOT)
@@ -660,31 +661,28 @@ class TestPzemPowerUnexpectedCheck(unittest.TestCase):
 #  Vent-complete confirmation gate (from main.py source)
 # ════════════════════════════════════════════════════════
 class TestVentCompleteReady(unittest.TestCase):
-    """VENTING -> IDLE requires BOTH atmospheric pressure AND explicit
-    operator confirmation the primary/roughing pump is off -- pressure
-    alone must never be enough (that let the turbo inlet valve reclose
-    before the operator could react)."""
+    """VENTING -> IDLE requires BOTH a latched atmospheric-pressure
+    indication AND explicit operator confirmation the primary/roughing
+    pump is off -- neither alone is ever enough (pending-alone let the
+    turbo inlet valve reclose before the operator could react; the raw-
+    voltage version of this check that predated the `pending` latch made
+    the Confirm Pump Off button flicker on any reading that dipped back
+    below the threshold)."""
 
     def setUp(self):
         self.ready = CAL["vent_complete_ready"]
 
-    def test_below_atmosphere_never_ready_even_if_confirmed(self):
-        self.assertFalse(self.ready(config.VENTING_COMPLETE_VOLTAGE - 0.1, True))
+    def test_not_pending_never_ready_even_if_confirmed(self):
+        self.assertFalse(self.ready(False, True))
 
-    def test_at_atmosphere_not_ready_without_confirmation(self):
-        self.assertFalse(self.ready(config.VENTING_COMPLETE_VOLTAGE, False))
+    def test_pending_not_ready_without_confirmation(self):
+        self.assertFalse(self.ready(True, False))
 
-    def test_above_atmosphere_not_ready_without_confirmation(self):
-        self.assertFalse(self.ready(config.VENTING_COMPLETE_VOLTAGE + 1.0, False))
+    def test_pending_and_confirmed_is_ready(self):
+        self.assertTrue(self.ready(True, True))
 
-    def test_at_atmosphere_and_confirmed_is_ready(self):
-        self.assertTrue(self.ready(config.VENTING_COMPLETE_VOLTAGE, True))
-
-    def test_above_atmosphere_and_confirmed_is_ready(self):
-        self.assertTrue(self.ready(config.VENTING_COMPLETE_VOLTAGE + 1.0, True))
-
-    def test_confirmed_alone_without_atmosphere_not_ready(self):
-        self.assertFalse(self.ready(0.0, True))
+    def test_neither_not_ready(self):
+        self.assertFalse(self.ready(False, False))
 
 
 # ════════════════════════════════════════════════════════
@@ -1405,6 +1403,111 @@ class TestChamberSim(unittest.TestCase):
         self.chamber.pirani_v = 3.3
         self._run(5.0)
         self.assertGreaterEqual(self.chamber.pzem_current, config.PZEM_PLASMA_CURRENT_ON_A)
+
+
+# ════════════════════════════════════════════════════════
+#  Web dashboard server (web_ui.WebUI) -- stdlib HTTP + SSE, tested
+#  against a real socket on an ephemeral port with fake state/commands.
+# ════════════════════════════════════════════════════════
+import json as _json
+import urllib.request
+import urllib.error
+
+
+class TestWebUI(unittest.TestCase):
+    def setUp(self):
+        self.snapshot = {"sm_state": "IDLE", "pirani_voltage": 1.5, "flag": True}
+        self.calls = []
+
+        def ok_cmd(value):
+            self.calls.append(("ok_cmd", value))
+            return True, ""
+
+        self.ui = WebUI(
+            get_snapshot=lambda: dict(self.snapshot),
+            commands={
+                "ok_cmd":   ok_cmd,
+                "fail_cmd": lambda v: (False, "guard rejected it"),
+                "boom":     lambda v: 1 / 0,
+            },
+            page_path=os.path.join(REPO_ROOT, "web", "index.html"),
+            port=0,                  # ephemeral -- avoids clashes between test runs
+            update_interval=0.02,
+        )
+        self.assertTrue(self.ui.start())
+        self.base = f"http://127.0.0.1:{self.ui.port}"
+
+    def tearDown(self):
+        self.ui.stop()
+
+    def _post(self, body_bytes):
+        req = urllib.request.Request(self.base + "/command", data=body_bytes,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                return resp.status, _json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, _json.loads(e.read())
+
+    def test_serves_dashboard_page(self):
+        with urllib.request.urlopen(self.base + "/", timeout=2) as resp:
+            self.assertEqual(resp.status, 200)
+            body = resp.read().decode()
+        self.assertIn("Sputter Vacuum Controller", body)
+        self.assertIn("EventSource", body, "page must connect to the SSE stream")
+
+    def test_sse_stream_yields_parseable_snapshots(self):
+        with urllib.request.urlopen(self.base + "/events", timeout=2) as resp:
+            self.assertEqual(resp.headers.get("Content-Type"), "text/event-stream")
+            line = resp.readline()
+            while not line.startswith(b"data:"):
+                line = resp.readline()
+        snap = _json.loads(line[len(b"data:"):].strip())
+        self.assertEqual(snap["sm_state"], "IDLE")
+        self.assertEqual(snap["pirani_voltage"], 1.5)
+
+    def test_command_dispatch_and_value_passthrough(self):
+        status, out = self._post(_json.dumps({"action": "ok_cmd", "value": "0.02"}).encode())
+        self.assertEqual(status, 200)
+        self.assertTrue(out["ok"])
+        self.assertEqual(self.calls, [("ok_cmd", "0.02")])
+
+    def test_command_failure_reported_not_raised(self):
+        status, out = self._post(_json.dumps({"action": "fail_cmd"}).encode())
+        self.assertEqual(status, 200)
+        self.assertFalse(out["ok"])
+        self.assertIn("guard rejected it", out["message"])
+
+    def test_unknown_action_rejected(self):
+        status, out = self._post(_json.dumps({"action": "no_such_thing"}).encode())
+        self.assertEqual(status, 400)
+        self.assertFalse(out["ok"])
+
+    def test_handler_exception_answers_500_and_server_survives(self):
+        status, out = self._post(_json.dumps({"action": "boom"}).encode())
+        self.assertEqual(status, 500)
+        self.assertFalse(out["ok"])
+        # the server must still be alive afterward
+        status, out = self._post(_json.dumps({"action": "ok_cmd"}).encode())
+        self.assertEqual(status, 200)
+        self.assertTrue(out["ok"])
+
+    def test_malformed_json_rejected(self):
+        status, out = self._post(b"this is not json{{")
+        self.assertEqual(status, 400)
+        self.assertFalse(out["ok"])
+
+    def test_unknown_path_404(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.base + "/nope", timeout=2)
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_port_conflict_degrades_gracefully(self):
+        second = WebUI(get_snapshot=lambda: {}, commands={},
+                       page_path=self.ui.page_path,
+                       port=self.ui.port,  # deliberately taken
+                       update_interval=0.02)
+        self.assertFalse(second.start(), "must return False, not raise")
 
 
 if __name__ == "__main__":

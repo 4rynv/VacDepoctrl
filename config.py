@@ -76,7 +76,7 @@ VENTING_COMPLETE_VOLTAGE    = 3.0     # Pirani voltage for near-atmosphere; VENT
                                       # the old 2.5V (~5 mbar — nowhere near atmosphere, the bug
                                       # this replaces).
 IDLE_PRESSURE_MAX_VOLTAGE   = 2.71    # Voltage threshold for safe pump-down start (10 mbar: 8.20V × 0.33)
-PUMP_DOWN_COMPLETE_VOLTAGE  = 0.2   # Pirani voltage for ~0.01 mbar; threshold for PUMP_DOWN -> READY transition
+PUMP_DOWN_COMPLETE_VOLTAGE  = 0.3   # Pirani voltage for ~0.01 mbar; threshold for PUMP_DOWN -> READY transition
 ARGON_FLUSH_TARGET_VOLTAGE  = 1.287   # Pirani voltage target for argon flush (0.09 mbar: 3.90V × 0.33)
 ARGON_FLUSH_FLOW_SETPOINT   = 150.0   # Initial MFC flow on flush entry; control loop takes over
 PRESSURE_CONTROL_KP         = 8.0    # Proportional gain for MFC pressure control loop (sccm/V-error)
@@ -319,6 +319,21 @@ GRAPH_MFC_COLOR = "#00FFFF"  # cyan
 GRAPH_TURBO_RPM_MIN = 0.0
 GRAPH_TURBO_RPM_MAX = TURBO_RPM_FULL_SCALE
 GRAPH_TURBO_RPM_COLOR = "#FF00FF"  # magenta
+
+# ════════════════════════════════════════════════════════
+#  WEB DASHBOARD (browser view, parallel to the Tkinter GUI)
+# ════════════════════════════════════════════════════════
+WEB_UI_ENABLED = True    # Serve the browser dashboard (web_ui.py). The local
+                         # Tkinter GUI always runs regardless -- the web UI is
+                         # a second view of the same process, never a
+                         # replacement, so network loss only costs the browser
+                         # page. Set False to not open the port at all.
+WEB_UI_PORT = 8080       # http://<pi>:<port>/ -- LAN-trust, NO authentication
+                         # (same trust model as the Pi's own VNC/SSH); see the
+                         # README's Web Dashboard section
+WEB_UI_UPDATE_INTERVAL = 0.2  # Seconds between SSE state pushes to each
+                              # connected browser -- matches the local GUI's
+                              # refresh cadence (GUI_REFRESH_INTERVAL)
 
 # ════════════════════════════════════════════════════════
 #  GUI REFRESH INTERVAL

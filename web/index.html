@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sputter Vacuum Controller</title>
+<style>
+  /* Dark instrument theme -- deliberately matches the Tkinter GUI's color
+     language (lime=Pirani, cyan=flow, yellow=DAC, magenta=RPM) so the
+     operator sees the same thing locally and remotely. Self-contained: no
+     CDN, no external fonts -- must render on a LAN with no internet. */
+  :root {
+    --page: #0f0f0f; --panel: #1a1a1a; --border: #333;
+    --ink: #e8e8e8; --ink-2: #9a9a9a; --grid: #333;
+    --lime: #00FF00; --cyan: #00FFFF; --yellow: #FFFF00;
+    --magenta: #FF00FF; --orange: #FFA500;
+    --red: #ff5252; --green: #4caf50; --blue: #7fb4e6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font-family: "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 700; }
+  .badge { padding: 2px 10px; border-radius: 3px; font-weight: 700; font-size: 12px; }
+  .badge.sim { background: var(--orange); color: #000; display: none; }
+  .badge.conn { background: #234; color: var(--blue); }
+  .badge.conn.lost { background: var(--red); color: #fff; }
+
+  main {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    padding: 12px 16px; max-width: 1500px; margin: 0 auto;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  section {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 4px; padding: 10px 12px;
+  }
+  section h2 {
+    font-size: 12px; margin: 0 0 8px; color: var(--ink-2);
+    font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .kv { line-height: 1.65; }
+  .kv b { color: var(--ink-2); font-weight: 400; display: inline-block; min-width: 9ch; }
+  .kv span { color: var(--ink); }
+
+  #state-name {
+    font-size: 26px; font-weight: 700; text-align: center;
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 8px; margin-bottom: 8px; background: #111;
+  }
+  #status-line { color: var(--ink-2); min-height: 1.4em; }
+  #status-line.err { color: var(--red); }
+  #safety-banner {
+    display: none; background: var(--red); color: #fff; font-weight: 700;
+    padding: 8px; border-radius: 3px; margin: 8px 0; white-space: pre-wrap;
+  }
+  #p-message { min-height: 2.6em; margin-top: 6px; }
+
+  .buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  button {
+    font-family: inherit; font-size: 14px; font-weight: 600;
+    padding: 9px 6px; border-radius: 4px; border: 1px solid #555;
+    background: #2a2a2a; color: var(--ink); cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #3a3a3a; }
+  button:disabled { opacity: 0.35; cursor: not-allowed; }
+  button.estop {
+    grid-column: 1 / -1; background: #c62828; border-color: #e53935;
+    color: #fff; font-size: 16px; padding: 12px;
+  }
+  button.estop:hover { background: #e53935; }
+  button.highlight { background: #2e7d32; border-color: var(--green); }
+  button.armed { background: var(--orange); color: #000; }
+  button.attention { background: var(--orange); color: #000; }
+  #btn-confirm-vent, #btn-sim-strike { display: none; grid-column: 1 / -1; }
+  #btn-clear-fault { display: none; width: 100%; margin-top: 6px;
+                     background: #c62828; border-color: #e53935; color: #fff; }
+
+  .inputs { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  .inputs label { color: var(--ink-2); }
+  .inputs input {
+    width: 9ch; font-family: inherit; font-size: 14px; padding: 5px;
+    background: #111; color: var(--ink); border: 1px solid #555; border-radius: 3px;
+  }
+  .inputs button { padding: 5px 12px; }
+
+  canvas { width: 100%; height: 130px; display: block; background: #141414;
+           border: 1px solid var(--border); border-radius: 3px; margin-top: 8px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px; font-size: 12px; }
+  .legend .item { display: flex; align-items: center; gap: 5px; color: var(--ink); }
+  .legend .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+  #tooltip {
+    position: fixed; display: none; pointer-events: none; z-index: 10;
+    background: #000d; border: 1px solid #555; border-radius: 3px;
+    padding: 5px 8px; font-size: 12px; white-space: pre; color: var(--ink);
+  }
+  #overlay {
+    position: fixed; inset: 0; z-index: 20; display: none;
+    background: #000c; color: #fff; text-align: center;
+    padding-top: 30vh; font-size: 20px; font-weight: 700;
+  }
+  #overlay small { display: block; margin-top: 12px; font-size: 13px;
+                   font-weight: 400; color: #bbb; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Sputter Vacuum Controller</h1>
+  <span class="badge sim" id="sim-badge">SIMULATION — no hardware attached</span>
+  <span class="badge conn" id="conn-badge">connecting…</span>
+</header>
+
+<main>
+  <!-- ── left column ─────────────────────────────── -->
+  <div style="display:flex; flex-direction:column; gap:12px;">
+    <section>
+      <h2>Process State</h2>
+      <div id="state-name">—</div>
+      <div id="safety-banner"></div>
+      <button id="btn-clear-fault" onclick="cmd('clear_fault')">Clear Fault</button>
+      <div id="status-line">OK</div>
+    </section>
+
+    <section>
+      <h2>Controls</h2>
+      <div class="buttons">
+        <button id="btn-start_flush"    onclick="cmd('start_flush')">Start Argon Flush</button>
+        <button id="btn-confirm_plasma" onclick="cmd('confirm_plasma')">Confirm Plasma</button>
+        <button id="btn-start_sputter"  onclick="cmd('start_sputter')">Start Sputter</button>
+        <button id="btn-stop_sputter"   onclick="cmd('stop_sputter')">Stop Sputter</button>
+        <button id="btn-vent"           onclick="cmd('vent')">Vent</button>
+        <button id="btn-auto-confirm"   onclick="cmd('toggle_auto_confirm')">Auto-Confirm: OFF</button>
+        <button id="btn-confirm-vent"   onclick="cmd('confirm_vent')">Confirm Pump Off</button>
+        <button id="btn-sim-strike"     onclick="cmd('sim_plasma_strike')">Plasma Strike (SIM): OFF</button>
+        <button class="estop"           onclick="cmd('estop')">E-STOP</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Pirani Gauge [A0]</h2>
+      <div class="kv">
+        <div><b>ADC</b> <span id="pirani_adc">—</span></div>
+        <div><b>Voltage</b> <span id="pirani_voltage">—</span></div>
+        <div><b>Pressure</b> <span id="pressure_mbar" style="font-weight:700">—</span></div>
+      </div>
+      <div id="p-message"></div>
+      <canvas id="chart-pirani" data-title="Pirani V"></canvas>
+    </section>
+
+    <section>
+      <h2>MFC Argon Flow [A1]</h2>
+      <div class="kv">
+        <div><b>ADC</b> <span id="mfc_adc">—</span></div>
+        <div><b>Voltage</b> <span id="mfc_voltage">—</span></div>
+        <div><b>Flow</b> <span id="mfc_flow" style="font-weight:700">—</span></div>
+        <div><b>DAC out</b> <span id="dac_out">—</span></div>
+        <div><b>Valve</b> <span id="mfc_valve">—</span></div>
+      </div>
+      <div class="inputs">
+        <label>Sputter P (mbar):</label>
+        <input id="in-sputter" type="number" step="0.001" min="0">
+        <button onclick="cmd('set_sputter_target', el('in-sputter').value)">Set</button>
+        <span id="sputter_set" style="color:var(--ink-2)"></span>
+      </div>
+      <div class="inputs">
+        <label>Argon PSI:</label>
+        <input id="in-psi" type="number" step="0.5" min="0">
+        <button onclick="cmd('set_argon_psi', el('in-psi').value)">Set</button>
+        <span id="psi_set" style="color:var(--ink-2)"></span>
+      </div>
+      <canvas id="chart-mfc"></canvas>
+      <div class="legend" id="legend-mfc"></div>
+    </section>
+  </div>
+
+  <!-- ── right column ────────────────────────────── -->
+  <div style="display:flex; flex-direction:column; gap:12px;">
+    <section>
+      <h2>Plasma [PZEM variac current]</h2>
+      <div class="kv">
+        <div><b>PLASMA</b> <span id="plasma_detected" style="font-weight:700">—</span></div>
+        <div><b>PZEM</b> <span id="pzem_ready">—</span></div>
+        <div><b>Voltage</b> <span id="pzem_voltage">—</span></div>
+        <div><b>Current</b> <span id="pzem_current">—</span></div>
+        <div><b>Power</b> <span id="pzem_power">—</span></div>
+        <div><b>Energy</b> <span id="pzem_energy">—</span></div>
+        <div><b>Freq/PF</b> <span id="pzem_fpf">—</span></div>
+      </div>
+      <canvas id="chart-pzem" style="height:170px"></canvas>
+      <div class="legend" id="legend-pzem"></div>
+    </section>
+
+    <section>
+      <h2>Turbo Pump [A2]</h2>
+      <div class="kv">
+        <div><b>T-RPM</b> <span id="turbo_rpm" style="font-weight:700">—</span></div>
+        <div><b>T-RPM V</b> <span id="turbo_rpm_voltage">—</span></div>
+        <div><b>OPTO</b> <span id="opto">—</span></div>
+        <div><b>T-VALVE</b> <span id="tvalve">—</span></div>
+      </div>
+      <canvas id="chart-rpm" data-title="Turbo RPM"></canvas>
+    </section>
+  </div>
+</main>
+
+<div id="tooltip"></div>
+<div id="overlay">
+  <span id="overlay-title">DISCONNECTED — no live data</span>
+  <small id="overlay-sub">The local GUI on the rig itself is unaffected and remains in control.<br>
+  This page reconnects automatically when the network returns.</small>
+</div>
+
+<script>
+"use strict";
+const el = id => document.getElementById(id);
+
+/* Mirrors state_machine.py's STATE_COLORS */
+const STATE_COLORS = {
+  IDLE: "#9a9a9a", PUMP_DOWN: "#FFA500", READY: "#4caf50",
+  ARGON_FLUSH: "#FF00FF", PLASMA_IGNITING: "#b569d4",
+  SPUTTER_READY: "#40E0D0", SPUTTERING: "#00FFFF", VENTING: "#FFA500",
+};
+const MSG_COLORS = { blue: "#7fb4e6", red: "#ff5252", "#FFA500": "#FFA500" };
+
+/* ── scrolling chart: fixed-size ring buffers, one canvas each ────────── */
+class Chart {
+  /* series: [{key, color, range(name in snap.graph), label, unit, dash?}] */
+  constructor(canvasId, series, samples) {
+    this.canvas = el(canvasId);
+    this.ctx = this.canvas.getContext("2d");
+    this.series = series.map(s => ({ ...s, data: [] }));
+    this.samples = samples || 60;
+    this.canvas.addEventListener("mousemove", e => this.hover(e));
+    this.canvas.addEventListener("mouseleave", () => hideTip());
+  }
+  push(snap) {
+    for (const s of this.series) {
+      s.data.push(snap[s.key]);
+      if (s.data.length > this.samples) s.data.shift();
+      s.lo = snap.graph[s.range][0];
+      s.hi = snap.graph[s.range][1];
+    }
+    this.samples = snap.graph.samples;
+    this.draw();
+  }
+  draw() {
+    const c = this.canvas, ctx = this.ctx;
+    const dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (c.width !== w * dpr) { c.width = w * dpr; c.height = h * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = "#333"; ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+      const y = h * i / 4;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    }
+    for (const s of this.series) {
+      if (s.data.length < 2) continue;
+      ctx.strokeStyle = s.color; ctx.lineWidth = 2;
+      ctx.setLineDash(s.dash ? [5, 3] : []);
+      ctx.beginPath();
+      const n = s.data.length, span = (s.hi - s.lo) || 1;
+      for (let i = 0; i < n; i++) {
+        const x = i * (w - 1) / (this.samples - 1);
+        const y = h - 2 - Math.max(0, Math.min(1, (s.data[i] - s.lo) / span)) * (h - 4);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    /* single-series charts: current value top-right (title carries identity) */
+    if (this.series.length === 1 && this.series[0].data.length) {
+      const s = this.series[0];
+      ctx.fillStyle = "#e8e8e8"; ctx.font = "700 12px monospace"; ctx.textAlign = "right";
+      ctx.fillText(fmt(s.data[s.data.length - 1]) + " " + s.unit, w - 6, 14);
+    }
+  }
+  hover(e) {
+    const r = this.canvas.getBoundingClientRect();
+    const n = this.series[0].data.length;
+    if (n < 2) return;
+    const i = Math.max(0, Math.min(n - 1,
+      Math.round((e.clientX - r.left) / (r.width - 1) * (this.samples - 1))));
+    const lines = this.series.map(s =>
+      `${s.label}: ${s.data[i] === undefined ? "—" : fmt(s.data[i])} ${s.unit}`);
+    showTip(e.clientX, e.clientY, lines.join("\n"));
+  }
+}
+const fmt = v => Math.abs(v) >= 1000 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(3);
+function showTip(x, y, text) {
+  const t = el("tooltip");
+  t.textContent = text; t.style.display = "block";
+  t.style.left = Math.min(x + 14, innerWidth - 170) + "px";
+  t.style.top = (y + 14) + "px";
+}
+function hideTip() { el("tooltip").style.display = "none"; }
+
+const charts = {
+  pirani: new Chart("chart-pirani", [
+    { key: "pirani_voltage", color: "#00FF00", range: "pirani", label: "Pirani", unit: "V" }]),
+  mfc: new Chart("chart-mfc", [
+    { key: "mfc_flow",    color: "#00FFFF", range: "mfc", label: "Flow", unit: "sccm" },
+    { key: "dac_voltage", color: "#FFFF00", range: "dac", label: "DAC",  unit: "V", dash: true }]),
+  pzem: new Chart("chart-pzem", [
+    { key: "pzem_voltage",      color: "#00FFFF", range: "pzem_v",  label: "V",  unit: "V" },
+    { key: "pzem_current",      color: "#FFFF00", range: "pzem_i",  label: "I",  unit: "A" },
+    { key: "pzem_power",        color: "#FF00FF", range: "pzem_p",  label: "P",  unit: "W" },
+    { key: "pzem_frequency",    color: "#00FF00", range: "pzem_hz", label: "Hz", unit: "Hz" },
+    { key: "pzem_power_factor", color: "#FFA500", range: "pzem_pf", label: "PF", unit: "" }]),
+  rpm: new Chart("chart-rpm", [
+    { key: "turbo_rpm", color: "#FF00FF", range: "rpm", label: "RPM", unit: "RPM" }]),
+};
+
+/* legends: swatch + neutral text (identity never color-alone) */
+function renderLegend(id, chart) {
+  el(id).innerHTML = chart.series.map(s => {
+    const last = s.data.length ? fmt(s.data[s.data.length - 1]) : "—";
+    return `<span class="item"><span class="sw" style="background:${s.color}"></span>` +
+           `${s.label}: ${last}${s.unit ? " " + s.unit : ""}</span>`;
+  }).join("");
+}
+
+/* ── commands ─────────────────────────────────────── */
+async function cmd(action, value) {
+  try {
+    const res = await fetch("/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(value === undefined ? { action } : { action, value }),
+    });
+    const out = await res.json();
+    if (!out.ok && out.message) flashStatus(out.message);
+  } catch (e) {
+    flashStatus("Command failed: no connection to the rig.");
+  }
+}
+let flashTimer = null;
+function flashStatus(msg) {
+  const s = el("status-line");
+  s.textContent = "ERR: " + msg; s.classList.add("err");
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => { s.classList.remove("err"); }, 5000);
+}
+
+/* ── live stream ──────────────────────────────────── */
+let lastMsg = 0;
+let pollStale = false;   /* control loop on the Pi stopped ticking (server_time
+                            vs last_tick) -- distinct from a dead connection:
+                            the stream can keep delivering frozen state, which
+                            must never be mistaken for live data */
+const es = new EventSource("/events");
+es.onmessage = e => {
+  lastMsg = Date.now();
+  const s = JSON.parse(e.data);
+  pollStale = (s.server_time - s.last_tick) > 3;
+  render(s);
+};
+es.onerror = () => updateLiveness();
+setInterval(updateLiveness, 500);
+function updateLiveness() {
+  const connOk = Date.now() - lastMsg < 3000;
+  const ok = connOk && !pollStale;
+  el("conn-badge").textContent = !connOk ? "DISCONNECTED" : pollStale ? "STALLED" : "LIVE";
+  el("conn-badge").classList.toggle("lost", !ok);
+  el("overlay").style.display = ok ? "none" : "block";
+  if (!connOk) {
+    el("overlay-title").textContent = "DISCONNECTED — no live data";
+    el("overlay-sub").innerHTML = "The local GUI on the rig itself is unaffected " +
+      "and remains in control.<br>This page reconnects automatically when the network returns.";
+  } else if (pollStale) {
+    el("overlay-title").textContent = "CONTROL LOOP STALLED on the rig";
+    el("overlay-sub").innerHTML = "The network is fine but the Pi's control loop has stopped " +
+      "ticking — the numbers behind this banner are FROZEN, not live.<br>" +
+      "The watchdog should force a safe shutdown; physically check the rig.";
+  }
+}
+
+function render(s) {
+  /* state + status */
+  const st = s.sm_state;
+  el("state-name").textContent = st;
+  el("state-name").style.color = STATE_COLORS[st] || "#9a9a9a";
+  const status = el("status-line");
+  if (!status.classList.contains("err")) status.textContent = s.error ? "ERR: " + s.error : "OK";
+  if (s.error) { status.textContent = "ERR: " + s.error; status.classList.add("err"); }
+  else if (!flashTimer || status.textContent === "OK") status.classList.remove("err");
+
+  const banner = el("safety-banner");
+  banner.style.display = s.safety_tripped ? "block" : "none";
+  banner.textContent = s.safety_tripped ? "SAFETY TRIP:\n" + s.safety_trip_reason : "";
+  el("btn-clear-fault").style.display = s.safety_tripped ? "block" : "none";
+
+  /* header badges */
+  el("sim-badge").style.display = s.sim_mode ? "inline-block" : "none";
+
+  /* buttons: same gating table as the Tk GUI, streamed from the server */
+  for (const k of ["start_flush", "confirm_plasma", "start_sputter", "stop_sputter", "vent"])
+    el("btn-" + k).disabled = !s.buttons[k];
+  el("btn-confirm_plasma").classList.toggle("highlight",
+    st === "PLASMA_IGNITING" && s.plasma_detected);
+  el("btn-auto-confirm").textContent = "Auto-Confirm: " + (s.pzem_auto_confirm ? "ON" : "OFF");
+  el("btn-auto-confirm").classList.toggle("armed", s.pzem_auto_confirm);
+  el("btn-confirm-vent").style.display = s.vent_complete_pending ? "block" : "none";
+  el("btn-confirm-vent").classList.add("attention");
+  el("btn-sim-strike").style.display = s.sim_mode ? "block" : "none";
+  el("btn-sim-strike").textContent = "Plasma Strike (SIM): " + (s.sim_plasma_strike ? "ON" : "OFF");
+  el("btn-sim-strike").classList.toggle("armed", s.sim_plasma_strike);
+
+  /* pirani */
+  el("pirani_adc").textContent = s.pirani_adc;
+  el("pirani_voltage").textContent = s.pirani_voltage.toFixed(6) + " V";
+  el("pressure_mbar").textContent = s.pressure_mbar >= 999
+    ? "ATM (>999 mbar)" : s.pressure_mbar.toPrecision(3) + " mbar";
+  el("p-message").textContent = s.p_message;
+  el("p-message").style.color = MSG_COLORS[s.p_message_color] || s.p_message_color;
+
+  /* mfc */
+  el("mfc_adc").textContent = s.mfc_adc;
+  el("mfc_voltage").textContent = s.mfc_voltage.toFixed(6) + " V";
+  el("mfc_flow").textContent = s.mfc_flow.toFixed(2) + " sccm Ar";
+  el("dac_out").textContent = s.dac_voltage.toFixed(3) + " V (" + s.dac_code + ")"
+    + (s.dac_ready ? "" : "  [DAC NOT DETECTED]");
+  el("dac_out").style.color = s.dac_ready ? "#4caf50" : "#ff5252";
+  el("mfc_valve").textContent = s.mfc_valve_closed ? "CLOSED" : "RELEASED";
+  el("mfc_valve").style.color = s.mfc_valve_closed ? "#ff5252" : "#4caf50";
+  el("sputter_set").textContent = "set: " + s.sputter_target_mbar.toFixed(4) + " mbar";
+  el("psi_set").textContent = "set: " + s.argon_pressure.toFixed(1) + " psi";
+
+  /* plasma / pzem */
+  el("plasma_detected").textContent = s.plasma_detected ? "DETECTED" : "not detected";
+  el("plasma_detected").style.color = s.plasma_detected ? "#4caf50" : "#9a9a9a";
+  el("pzem_ready").textContent = s.pzem_ready ? "OK" : "NOT DETECTED";
+  el("pzem_ready").style.color = s.pzem_ready ? "#4caf50" : "#ff5252";
+  el("pzem_voltage").textContent = s.pzem_voltage.toFixed(1) + " V";
+  el("pzem_current").textContent = s.pzem_current.toFixed(2) + " A";
+  el("pzem_power").textContent = s.pzem_power.toFixed(1) + " W";
+  el("pzem_energy").textContent = s.pzem_energy.toFixed(0) + " Wh";
+  el("pzem_fpf").textContent = s.pzem_frequency.toFixed(1) + " Hz  " +
+    s.pzem_power_factor.toFixed(2) + " PF";
+
+  /* turbo */
+  el("turbo_rpm").textContent = s.turbo_rpm.toFixed(0) + " RPM";
+  el("turbo_rpm_voltage").textContent = s.turbo_rpm_voltage.toFixed(3) + " V";
+  el("opto").textContent = s.opto_enabled ? "ON" : "OFF";
+  el("opto").style.color = s.opto_enabled ? "#4caf50" : "#ff5252";
+  el("tvalve").textContent = s.turbo_valve_open ? "OPEN (venting)" : "CLOSED";
+  el("tvalve").style.color = s.turbo_valve_open ? "#FFA500" : "#4caf50";
+
+  /* charts + legends */
+  for (const c of Object.values(charts)) c.push(s);
+  renderLegend("legend-mfc", charts.mfc);
+  renderLegend("legend-pzem", charts.pzem);
+}
+</script>
+</body>
+</html>

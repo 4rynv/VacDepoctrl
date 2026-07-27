@@ -9,7 +9,7 @@ from config import (
 # ── Valid manual transitions ──────────────────────────
 VALID_TRANSITIONS = {
     "IDLE":            ["PUMP_DOWN"],
-    "PUMP_DOWN":       ["IDLE"],
+    "PUMP_DOWN":       ["IDLE", "VENTING"],
     "READY":           ["PUMP_DOWN", "ARGON_FLUSH", "VENTING", "IDLE"],
     "ARGON_FLUSH":     ["PLASMA_IGNITING", "READY", "VENTING", "IDLE"],
     "PLASMA_IGNITING": ["SPUTTER_READY", "VENTING", "IDLE"],

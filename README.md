@@ -16,6 +16,8 @@ A Raspberry Pi-based vacuum process controller for DC magnetron sputter depositi
 - [Installation](#installation)
 - [Running](#running)
 - [Remote GUI Access](#remote-gui-access)
+- [Web Dashboard](#web-dashboard)
+- [Simulation Mode](#simulation-mode)
 - [Configuration](#configuration)
 - [GUI Guide](#gui-guide)
 - [Known Limitations](#known-limitations)
@@ -160,6 +162,13 @@ Modbus-RTU, 9600 baud 8N1, factory-default slave address `0xF8`. `pzem_meter.py`
 
 Auto-confirm is an explicit operator opt-in, not the default, because `PZEM_PLASMA_CURRENT_ON_A` is unvalidated — the same reasoning as every other "unvalidated until confirmed on the bench" threshold in `config.py`. `PLASMA_IGNITING`'s own `PLASMA_IGNITION_TIMEOUT` abort-to-READY path is unchanged and still the fallback if neither manual nor auto-confirm fires.
 
+#### Bring-up notes / troubleshooting
+
+- **Board-specific terminal layout, not the generic datasheet.** On Aryan's board, the AC-side 4-terminal block is L / N (voltage sense, across variac output) and two CT-lead terminals — but the *position* of these on the physical block didn't match the generic PZEM-004T datasheet. The L line initially went to the board's 10A direct-pass-through terminal position instead of the 100A/CT-clamp position; moving it to the correct terminal (found via the board's own silkscreen, not the datasheet) fixed it. **Always read your specific board's silkscreen, not a generic online diagram.**
+- **The PZEM's measurement MCU is powered from the AC L/N line itself**, not the TTL 5V header. Symptom if you wire TTL first and haven't energized L/N yet: CP2102 TX blinks (host is sending fine), PZEM never replies — looks like a dead unit but is just unpowered. Resolves once L/N is actually connected to live AC.
+- **A struck-but-undetected plasma likely means the CT isn't sensing the load, not a threshold-tuning problem.** Hit 2026-07-12: operator visually confirmed plasma and clicked Confirm Plasma, `PLASMA_IGNITING → SPUTTER_READY` succeeded, then `pzem_plasma_absent_check()` force-shut-down 5s later with the PZEM reporting **0.00 A** the entire time. A true zero (not "some current below 1.0A") points at the sensor path, not calibration — most likely the CT clamp isn't actually installed on the load line yet (this repo's CT bring-up was still pending a bench test on the real variac-output load as of the prior session), or is clamped over both L and N together (fields cancel to ~0A), rather than L alone.
+- **If real current draw is small relative to the CT's 100A rating, wind multiple turns of the live conductor through the clamp before closing it.** A CT senses ampere-*turns*, so *N* turns gives `N × I_actual` on the reading — useful because a 100A-rated core sensing a sub-1A sputtering load sits at the very bottom of its response curve, where accuracy/noise floor issues are common. Divide the reported current/power by *N* in software to recover the true value, or (simpler, since only the comparison matters) scale `PZEM_PLASMA_CURRENT_ON_A`/`_OFF_A` by *N* instead. Sanity-check the real current independently first (a separate clamp meter, or the sputtering supply's own front-panel readout) before deciding how many turns to use.
+
 ### Cross-Sensor Consistency Checks
 
 Every threshold elsewhere in this doc compares one sensor to one fixed value. These instead compare two live readings to each other — catching a case where each reading is individually "in range" but the two together don't make physical sense. All feed the **global safety gate** below: a sustained flag forces a full hardware cutoff, not just a status message. Grace periods are placeholder defaults (favor fewer false positives over noise from normal settling time) — tune once measured against real spin-up/response/settling behavior on the bench. Because a false positive forces a real shutdown, treat these as unvalidated until confirmed on the bench.
@@ -238,7 +247,10 @@ main.py
 │   ├── Live pressure readout in mbar (adc_voltage_to_mbar)
 │   ├── Manual set-point entry fields (sputter target mbar, argon PSI)
 │   ├── Error display with ERROR_DISPLAY_SECONDS auto-expiry
-│   └── Button callbacks → sm.transition()
+│   └── Button callbacks → shared _try_*() operator commands
+├── Web dashboard server (daemon threads — web_ui.py, see Web Dashboard)
+│   ├── GET /events — SSE stream of _state snapshots to each browser
+│   └── POST /command — dispatches the SAME _try_*() operator commands
 └── Hardware interlock callback
     └── handle_hardware_interlocks() — fires on every state transition
 ```
@@ -263,10 +275,16 @@ Sputter_ctrl/
 ├── turbo_rpm.py       — TurboRPMController class (ADC A2 tach → RPM)
 ├── pzem_meter.py      — PZEMController class (PZEM-004T-100A, Modbus-RTU over USB-TTL)
 ├── graph.py           — ScrollingGraph class (pure Tkinter, no matplotlib; single/dual/multi-series)
-├── setup.sh           — venv + dependency installer
-├── Docs/              — Pirani calibration datasheet PDF
+├── sim_hardware.py    — ChamberSim + fake hardware modules for SPUTTER_SIM=1 (Simulation Mode)
+├── web_ui.py          — browser dashboard server (stdlib HTTP + SSE), parallel to the Tkinter GUI
+├── web/
+│   └── index.html     — the dashboard page (self-contained: inline CSS/JS, no CDN)
+├── setup.sh           — venv + dependency installer, also installs the desktop launcher
+├── Sputter_ctrl.desktop — desktop launcher icon (installed by setup.sh; see Installation)
+├── Docs/              — Pirani datasheet PDF, GUI screenshot, desktop/app icon source (app-icon*.png, AppIcon.icns)
 ├── scripts/
-│   └── setup_remote_gui_macos.sh — one-time XQuartz setup, see Remote GUI Access
+│   ├── setup_remote_gui_macos.sh — one-time XQuartz setup, see Remote GUI Access
+│   └── build_mac_launchers.sh    — builds the Sputter Remote.app / Sputter Simulation.app Desktop icons
 └── tests/
     ├── adc_test.py         — ADS1115 read loop (bus 3)
     ├── dac_test.py         — MCP4725 sweep + readback (bus 3)
@@ -313,7 +331,7 @@ Sputter_ctrl/
                                                             IDLE
 
          Any state ──[Vent]──► VENTING ──(3.0V Pirani + Confirm Pump Off)──► IDLE
-         Any state ──[E-STOP]──► IDLE (immediate hardware cutoff)
+         Any state ──[E-STOP]──► IDLE (immediate hardware cutoff, latched — Clear Fault to resume)
 ```
 
 ### Automatic Transitions
@@ -322,7 +340,7 @@ Sputter_ctrl/
 |---|---|---|---|
 | `IDLE` | `PUMP_DOWN` | Pirani voltage ≤ 2.71V (10 mbar) | `_poll()` |
 | `PUMP_DOWN` | `IDLE` | Pirani voltage ≥ 2.71V (pump failure/leak) | `_poll()` + `sm.update()` |
-| `PUMP_DOWN` | `READY` | Voltage ≤ 0.2V AND opto enabled | `sm.update()` |
+| `PUMP_DOWN` | `READY` | Voltage ≤ 0.3V AND opto enabled | `sm.update()` |
 | `READY` | `PUMP_DOWN` | Pirani voltage ≥ 2.71V (pressure degraded) | `sm.update()` |
 | `ARGON_FLUSH` | `PLASMA_IGNITING` | Voltage ≥ 1.287V (0.09 mbar) | **`_poll()` only** — sole owner: arms the ignition timeout and fires `_ignite_plasma()` |
 | `PLASMA_IGNITING` | `READY` | 120s timeout, no plasma confirmation | `_poll()` |
@@ -339,9 +357,9 @@ Sputter_ctrl/
 | Confirm Plasma | `PLASMA_IGNITING → SPUTTER_READY` | None |
 | Start Sputter | `SPUTTER_READY → SPUTTERING` | Argon inlet ≥ 15 psi |
 | Stop Sputter | `SPUTTERING → VENTING` | None |
-| Vent | Most states → `VENTING` | None |
+| Vent | `PUMP_DOWN`, `READY`, `ARGON_FLUSH`, `PLASMA_IGNITING`, `SPUTTER_READY`, `SPUTTERING` → `VENTING` | None — `PUMP_DOWN` added 2026-07-12 (previously only `IDLE→PUMP_DOWN→IDLE` was reachable from PUMP_DOWN; vent is now available mid-pump-down too) |
 | Confirm Pump Off | `VENTING → IDLE` | Only appears once atmosphere is reached; see [Vent Completion Confirmation](#vent-completion-confirmation) |
-| E-STOP | Any → `IDLE` | None — immediate |
+| E-STOP | Any → `IDLE` | None — immediate. Routes through `_force_safe_shutdown()`: closes the turbo valve by direct GPIO write (no dependency on the poll thread being alive) and **latches** — Clear Fault required to resume, like a real EMO reset |
 
 ### Hardware Interlock Callback
 
@@ -364,8 +382,8 @@ All voltages are post-divider (ADC input, ×0.33 from raw gauge output). Convers
 | ~213 | — | 3.0 | `VENTING_COMPLETE_VOLTAGE` — VENTING → IDLE (safety margin below the 3.30V atmosphere point so the transition reliably fires) |
 | 10 | 8.20 | 2.706 | `IDLE_PRESSURE_MAX_VOLTAGE` — pump-down gate |
 | 0.09 | 3.90 | 1.287 | `ARGON_FLUSH_TARGET_VOLTAGE` — plasma ignition pressure |
-| ~0.09 | 3.94 | 1.3 | Turbo enable opto fires (PUMP_DOWN, transition-based) |
-| ~0.0037 | 0.61 | 0.2 | `PUMP_DOWN_COMPLETE_VOLTAGE` — PUMP_DOWN → READY gate |
+| ~0.183 | 4.24 | 1.4 | Turbo enable opto fires (PUMP_DOWN, transition-based; raised from 1.3V 2026-07-12) |
+| ~0.0057 | 0.91 | 0.3 | `PUMP_DOWN_COMPLETE_VOLTAGE` — PUMP_DOWN → READY gate (raised from 0.2V 2026-07-12) |
 | 0.007 | 1.10 | 0.363 | 0.007 mbar — default sputtering pressure |
 
 The GUI displays live pressure in mbar (bold, under the voltage readout), computed via `adc_voltage_to_mbar()`; reads `ATM (>999 mbar)` at ADC saturation.
@@ -380,9 +398,10 @@ Validated at entry: must be `> 0` and `≤ SPUTTER_TARGET_MAX_MBAR` (0.05 mbar).
 
 Transition-based, not level-based:
 
-- Goes **HIGH** the first time Pirani voltage drops below **1.3V** during `PUMP_DOWN`
+- Goes **HIGH** the first time Pirani voltage drops below **1.4V** during `PUMP_DOWN` (raised from 1.3V 2026-07-12)
 - Once set, stays HIGH until any state transition resets it via the interlock callback
 - This prevents opto chatter on noisy ADC readings near the threshold
+- Separate from `TURBOOPTO_ON_THRESHOLD`/`TURBOOPTO_OFF_THRESHOLD` in `config.py` (ADC-count based, ~1.31V/~1.87V) — those drive `pirani.py`'s `auto_opto=True` hysteresis path used in READY/ARGON_FLUSH, a different code path from this PUMP_DOWN transition-based one. The two are not currently kept in sync; only the PUMP_DOWN threshold above was changed this session.
 
 ---
 
@@ -420,7 +439,7 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-This installs `adafruit-blinka`, `adafruit-circuitpython-ads1x15`, `adafruit-extended-bus`, and `RPi.GPIO` into a venv at `~/Sputter_ctrl/venv/`, and adds a `source_sputt` alias to `~/.bashrc`.
+This installs `adafruit-blinka`, `adafruit-circuitpython-ads1x15`, `adafruit-extended-bus`, `RPi.GPIO`, and `pyserial` into a venv at `~/Sputter_ctrl/venv/`, adds a `source_sputt` alias to `~/.bashrc`, and places a **Sputter Vacuum Controller** icon on the desktop (`Sputter_ctrl.desktop`) — double-click it to launch `main.py` directly, no terminal needed. First launch may need a one-time "Allow Launching" confirmation (right-click the icon → Allow Launching) depending on the desktop environment's trust settings for new `.desktop` files.
 
 ```bash
 source ~/.bashrc
@@ -529,6 +548,35 @@ server, not just the local Unix socket `ssh -X` normally uses — a real
 automatically by the script above; only turn it on if the standard path
 above doesn't work.
 
+**Desktop launcher (optional):** once XQuartz is set up, `./scripts/build_mac_launchers.sh`
+builds two double-clickable `.app` icons on the Desktop — the Mac
+equivalent of `Sputter_ctrl.desktop` on the Pi:
+
+- **Sputter Remote.app** — picks a rig from a small known-rigs list baked
+  into the app (edit `RIGS` in `scripts/build_mac_launchers.sh` and rebuild
+  to add more — one entry auto-connects with no prompt, several show a
+  choose-from-list dialog), then runs the `ssh -X` command above for you.
+  Connects via the Pi's mDNS hostname (`av.local`) rather than a raw IP —
+  DHCP has moved this rig's address before, but the mDNS name survives
+  that. The SSH password itself is left to `ssh`'s own normal interactive
+  Terminal prompt (secure, no extra tooling) rather than something like
+  `sshpass`.
+- **Sputter Simulation.app** — runs Simulation Mode locally (see below);
+  no Pi or XQuartz-to-Pi connection needed, just XQuartz itself.
+
+Both open Terminal.app rather than running silently, since `main.py`'s
+startup self-test prints failures to the console before any GUI window
+exists — same reasoning as `Terminal=true` in the Pi's `.desktop` file.
+First launch of either needs a one-time right-click → Open to bypass
+Gatekeeper's unsigned-app warning.
+
+> [!note] Live network discovery was tried and doesn't work here
+> mDNS *service* browsing (`dns-sd -B _ssh._tcp`) was the first approach
+> tried for "find the Pi automatically" — it doesn't find this rig, since
+> Avahi on the Pi isn't advertising `_ssh._tcp` (only plain hostname
+> resolution works, which is what `av.local` above relies on). A maintained
+> list is simply more reliable than scanning here.
+
 ### Windows
 
 Two options — pick one:
@@ -556,6 +604,100 @@ source_sputt && cd ~/Sputter_ctrl && python main.py
 
 ---
 
+## Web Dashboard
+
+Any browser on the LAN gets the full live interface — readouts, graphs, and
+controls — at:
+
+```
+http://av.local:8080          (or http://<pi-ip>:8080)
+```
+
+No app, no XQuartz, no SSH, no per-OS setup; works from a phone. Served by
+`web_ui.py` (stdlib HTTP + Server-Sent Events — nothing to install) with the
+page in `web/index.html` (self-contained, no CDN: renders on a LAN with no
+internet).
+
+**Parallel by design, never a replacement.** The web dashboard is a second
+*view* of the same running `main.py` — the local Tkinter GUI always runs
+regardless (`WEB_UI_ENABLED` only controls the browser side). A network
+problem can therefore only ever cost the browser page; the control loop and
+the local GUI on the rig don't know or care whether anyone is connected. The
+page makes staleness unmissable: if the stream stops for >3 s it greys out
+behind a DISCONNECTED banner rather than silently showing frozen numbers.
+
+**Commands are the same code path as the local buttons.** Every browser
+action dispatches the exact `_try_*()` function the corresponding Tkinter
+button calls — same argon-pressure guards, same state-machine locks, same
+confirmation gates (Confirm Plasma, Confirm Pump Off, Clear Fault). Every
+web command is appended to `sputter_ctrl.log` with the client's IP, so the
+audit trail records who did what from where.
+
+> [!warning] No authentication
+> Anyone on the LAN who can reach port 8080 can operate the rig — the same
+> trust model as the Pi's own VNC/SSH access. Don't expose the Pi to a
+> network you don't control; set `WEB_UI_ENABLED = False` in `config.py` to
+> not open the port at all.
+
+Troubleshooting: browsers with **HTTPS-Only mode** (Firefox especially)
+rewrite a bare `<ip>:8080` to `https://` and fail with
+`SSL_ERROR_RX_RECORD_TOO_LONG` — the server is plain HTTP, so the URL must
+start with an explicit `http://`. The Tkinter header shows the full URL in a
+selectable field with a Copy button for exactly this reason.
+
+> [!warning] Deploy this feature as a set, not piecemeal
+> `WEB_UI_ENABLED` lives in `config.py`, but the code it depends on
+> (`web_ui.py`, `web/index.html`) are separate files. A partial `scp` that
+> ships a `config.py` with `WEB_UI_ENABLED = True` but not the other two
+> crashes `main.py` on startup with `ModuleNotFoundError: No module named
+> 'web_ui'` — **every** launch path fails identically (desktop icon, SSH -X,
+> plain SSH), since the crash happens at import time before Tkinter ever
+> gets a chance to open a window. Hit and fixed 2026-07-12. Always deploy
+> `config.py` together with `web_ui.py` + `web/index.html`, or set
+> `WEB_UI_ENABLED = False` on the Pi if you're deliberately deploying
+> without the dashboard for now.
+
+---
+
+## Simulation Mode
+
+Runs the full GUI and control loop — state machine, PID loop, cross-sensor
+checks, plasma detection — on any machine with no Pi, no sensors, and no
+GPIO/I2C/serial hardware attached. Useful for developing/demoing this
+project, or just poking at the UI without risking anything.
+
+```bash
+SPUTTER_SIM=1 python main.py
+# or
+python main.py --sim
+```
+
+`sim_hardware.py` installs fake `RPi.GPIO` / `adafruit_ads1x15` /
+`adafruit_extended_bus` / `serial` modules into `sys.modules` before
+`main.py`'s own hardware imports run (the same technique the hardware-free
+test suite uses) — but unlike the test suite's static, manually-set values,
+these are backed by a live physics model (`ChamberSim`) that reacts to
+whatever the real control loop actually commands: turbo RPM ramps when the
+enable opto goes high, pressure falls while pumping and rises when the
+turbo valve opens or the MFC commands flow, MFC measured flow chases
+commanded flow with a lag, etc. The window shows an unmissable orange
+"SIMULATION MODE" banner so it's never confused with a real run.
+
+**Plasma strikes are manual, not automatic.** An early version auto-triggered
+the simulated variac current from a flow+low-pressure heuristic, but that
+fired during ARGON_FLUSH itself — before any real ignition attempt, since
+the PID legitimately drives flow/pressure into the same range just
+converging on the flush target. `_ignite_plasma()` is still a stub on real
+hardware too, so nothing should auto-decide this in the simulation either.
+Instead, Simulation Mode adds a **"Plasma Strike (SIM)"** toggle button to
+the Controls panel — click it whenever you want to simulate the plasma
+actually igniting; it stays exactly as set until toggled again.
+
+On macOS, `./scripts/build_mac_launchers.sh` builds a double-clickable
+**Sputter Simulation.app** — see [Remote GUI Access](#remote-gui-access) above.
+
+---
+
 ## Configuration
 
 All tunable parameters are in `config.py`. Key constants:
@@ -573,7 +715,7 @@ GPIO_TURBO_VALVE_PIN         = 22      # turbo inlet valve relay (was GPIO 4 —
 
 # Pressure thresholds (post-divider volts unless noted)
 IDLE_PRESSURE_MAX_VOLTAGE    = 2.71    # 10 mbar  — pump-down gate
-PUMP_DOWN_COMPLETE_VOLTAGE   = 0.2     # PUMP_DOWN → READY gate
+PUMP_DOWN_COMPLETE_VOLTAGE   = 0.3     # PUMP_DOWN → READY gate
 ARGON_FLUSH_TARGET_VOLTAGE   = 1.287   # 0.09 mbar — plasma ignition pressure
 VENTING_COMPLETE_VOLTAGE     = 3.0     # VENTING → IDLE threshold (near-atmosphere; see Pressure Reference)
 SPUTTER_TARGET_MAX_MBAR      = 0.05    # cap on the operator-settable Sputter P field
@@ -642,7 +784,7 @@ If you change `POLLING_INTERVAL`, expect to retune Kd and Ki — both depend on 
 | **Stop Sputter** | Ends sputtering, transitions directly to VENTING |
 | **Vent** | Vents chamber to atmosphere |
 | **Confirm Pump Off** | Hidden until atmospheric pressure is reached during VENTING; click completes the vent (closes the turbo inlet valve, transitions to IDLE) — see [Vent Completion Confirmation](#vent-completion-confirmation) |
-| **E-STOP** | Immediate: kills flow, closes valve, drops opto, returns to IDLE |
+| **E-STOP** | Immediate: kills flow, closes both valves (turbo valve by direct GPIO write — works even with a hung poll thread), drops opto, returns to IDLE and **latches**; Clear Fault to resume |
 | **Voltage + Pressure (mbar)** | Live Pirani readings; mbar via log-linear calibration table |
 | **OPTO** | Turbo Pump panel. Green = turbo enable opto on; Red = off |
 | **T-VALVE** | Turbo Pump panel. Green `CLOSED` = inlet valve shut (normal); Orange `OPEN (venting)` = venting and turbo RPM has dropped to/below `TURBO_VALVE_OPEN_RPM_MAX` |
@@ -664,6 +806,7 @@ If you change `POLLING_INTERVAL`, expect to retune Kd and Ki — both depend on 
 - **No series protection resistors on ADC inputs yet** — recommended as general input protection.
 - **`_ignite_plasma()` is a stub**: RF power supply trigger is not yet implemented.
 - **PZEM plasma-detection thresholds are unvalidated placeholders** (`PZEM_PLASMA_CURRENT_ON_A`/`OFF_A`): guessed values, not yet measured against the real supply's no-load vs. struck-plasma current. This is why Auto-Confirm defaults off — see [Energy Meter](#energy-meter-pzem-004t-100a-plasma-ignition-sensing).
+- **PZEM CT clamp not yet confirmed on the real variac-output load line**: a 2026-07-12 run with visually-confirmed plasma still read 0.00A and force-shut-down via `pzem_plasma_absent_check()`. Until the CT is verified clamped correctly on the live load conductor (and, if the real current is low relative to the CT's 100A rating, wound through with multiple turns — see [Energy Meter bring-up notes](#bring-up-notes--troubleshooting)), plasma auto-detection cannot be trusted; keep Auto-Confirm off and rely on the manual Confirm Plasma button.
 
 ---
 

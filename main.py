@@ -17,6 +17,24 @@ if SIM_MODE:
     import sim_hardware
     _sim_chamber = sim_hardware.install()
 
+# Single-instance lock, taken BEFORE any hardware is touched: two instances
+# fighting over the same DAC/valve-relay/opto pins is a real hazard, not a
+# theoretical one (it has happened -- the "channel already in use" GPIO
+# warnings during remote-GUI experiments were exactly this). flock() is
+# released by the kernel on ANY process exit, including SIGKILL, so a crash
+# can never leave a stale lock behind. The handle must stay referenced for
+# the life of the process. (*.lock is gitignored.)
+import fcntl
+_instance_lock = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   ".sputter_ctrl.lock"), "w")
+try:
+    fcntl.flock(_instance_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    print("Another instance of main.py is already running (holding "
+          ".sputter_ctrl.lock) — refusing to start a second control loop "
+          "on the same hardware.", file=sys.stderr)
+    sys.exit(1)
+
 import logging
 import math
 import socket
@@ -94,6 +112,9 @@ from config import (
     GRAPH_PZEM_POWER_MAX,
     GRAPH_PZEM_FREQ_MIN,
     GRAPH_PZEM_FREQ_MAX,
+    WEB_UI_ENABLED,
+    WEB_UI_PORT,
+    WEB_UI_UPDATE_INTERVAL,
 )
 # Pirani calibration table: (mbar, gauge_voltage) from datasheet
 # ADC voltage = gauge_voltage * 0.33 (resistor divider)
@@ -259,19 +280,30 @@ def pressure_convergence_check(current_voltage, target_voltage, diverging_since,
     flagged = (now - diverging_since) >= PRESSURE_CONVERGENCE_GRACE_SECONDS
     return flagged, diverging_since
 
-def vent_complete_ready(pirani_voltage, confirmed):
+def vent_complete_ready(pending, confirmed):
     """Pure decision: has VENTING earned its transition to IDLE? Requires
-    BOTH atmospheric pressure (VENTING_COMPLETE_VOLTAGE) AND explicit
-    operator confirmation that the primary/roughing pump has been turned
-    off. Pressure alone used to auto-complete this via sm.update(), but
-    that let the turbo inlet valve reclose (turbo_valve_step() closes it
-    the instant `venting` goes False) the moment atmosphere was reached —
-    before the operator had any real chance to react to the "turn off the
-    primary pump" cue, let alone actually flip the switch. Now owned
-    exclusively by _poll(), the same way ARGON_FLUSH -> PLASMA_IGNITING is
-    (see state_machine.py's update() docstring).
+    BOTH a latched atmospheric-pressure indication AND explicit operator
+    confirmation that the primary/roughing pump has been turned off.
+
+    `pending` must already be latched by the caller (see _poll()'s VENTING
+    branch: it sets `_state["vent_complete_pending"]` True on first
+    crossing VENTING_COMPLETE_VOLTAGE and never clears it back to False on
+    its own) rather than re-checking raw pressure here -- a first version
+    checked the instantaneous voltage fresh every tick, which meant a
+    single noisy/borderline reading hovering right at the threshold made
+    the "Confirm Pump Off" button flicker in and out of existence every
+    poll tick. Every other threshold in this file is debounced or latched
+    for exactly this reason; this one is no different.
+
+    Pressure alone used to auto-complete this via sm.update(), but that let
+    the turbo inlet valve reclose (turbo_valve_step() closes it the instant
+    `venting` goes False) the moment atmosphere was reached — before the
+    operator had any real chance to react to the "turn off the primary
+    pump" cue, let alone actually flip the switch. Now owned exclusively by
+    _poll(), the same way ARGON_FLUSH -> PLASMA_IGNITING is (see
+    state_machine.py's update() docstring).
     """
-    return pirani_voltage >= VENTING_COMPLETE_VOLTAGE and confirmed
+    return pending and confirmed
 
 
 _PZEM_PLASMA_EXPECTED_STATES = ("PLASMA_IGNITING", "SPUTTER_READY", "SPUTTERING")
@@ -556,6 +588,7 @@ _state = {
     "pzem_power_factor": 0.0,
     "plasma_detected":  False,   # PZEM current-draw detection, see plasma_detect_step()
     "pzem_auto_confirm": False,  # operator-armed: auto-advance PLASMA_IGNITING -> SPUTTER_READY
+    "sim_plasma_strike": False,  # SIM_MODE only: operator's manual plasma-strike toggle
 
     "sm_state":        "IDLE",
     "error":           "",
@@ -622,7 +655,19 @@ def _force_safe_shutdown(reason):
     _set_error(f"[FORCED SHUTDOWN] {reason}")
 
 
-def _on_clear_fault():
+# ════════════════════════════════════════════════════════
+#  OPERATOR COMMANDS
+# ════════════════════════════════════════════════════════
+# Every operator command is a _try_*() function returning (ok, message) --
+# shared verbatim by the Tkinter buttons and the web dashboard
+# (web_ui.py), so a browser click and a local click go through the exact
+# same guards, locks, and audit logging. None of these touch Tkinter
+# (messagebox/widgets): they are safe to call from the web server's
+# request threads, the same way the Tk button callbacks already run on a
+# different thread than _poll(). The thin _on_*() Tk wrappers below add
+# only local-operator presentation (modal warning dialogs).
+
+def _try_clear_fault(value=None):
     """Operator acknowledgment for a latched safety trip -- see
     _force_safe_shutdown(). Unblocks IDLE's auto-resume-to-PUMP_DOWN; does
     NOT reset the underlying check's own timers, so an unaddressed fault
@@ -632,40 +677,59 @@ def _on_clear_fault():
         _state["safety_tripped"] = False
         _state["safety_trip_reason"] = ""
     _log_event("Safety fault cleared by operator.")
+    return True, ""
 
 
-def _on_start_argon_flush():
+def _argon_guard(action):
     with _lock:
         argon_pressure = _state["argon_pressure"]
-
     if argon_pressure < ARGON_PRESSURE_MIN_PSI:
-        messagebox.showwarning(
-            "Argon pressure low",
-            f"Argon pressure is {argon_pressure:.1f} psi. "
-            f"Increase it to at least {ARGON_PRESSURE_MIN_PSI:.0f} psi before starting argon flush."
-        )
-        _set_error(f"Argon pressure below {ARGON_PRESSURE_MIN_PSI:.0f} psi; cannot start argon flush.")
-        return
+        return False, (f"Argon pressure below {ARGON_PRESSURE_MIN_PSI:.0f} psi; "
+                       f"cannot start {action}.")
+    return True, ""
 
+
+def _try_start_argon_flush(value=None):
+    ok, msg = _argon_guard("argon flush")
+    if not ok:
+        _set_error(msg)
+        return False, msg
     if not sm.transition("ARGON_FLUSH"):
-        _set_error("Cannot start argon flush in the current state.")
+        msg = "Cannot start argon flush in the current state."
+        _set_error(msg)
+        return False, msg
+    return True, ""
 
 
-def _on_start_sputter():
-    with _lock:
-        argon_pressure = _state["argon_pressure"]
-
-    if argon_pressure < ARGON_PRESSURE_MIN_PSI:
-        messagebox.showwarning(
-            "Argon pressure low",
-            f"Argon pressure is {argon_pressure:.1f} psi. "
-            f"Increase it to at least {ARGON_PRESSURE_MIN_PSI:.0f} psi before starting sputtering."
-        )
-        _set_error(f"Argon pressure below {ARGON_PRESSURE_MIN_PSI:.0f} psi; cannot start sputtering.")
-        return
-
+def _try_start_sputter(value=None):
+    ok, msg = _argon_guard("sputtering")
+    if not ok:
+        _set_error(msg)
+        return False, msg
     if not sm.transition("SPUTTERING"):
-        _set_error("Cannot start sputtering in the current state.")
+        msg = "Cannot start sputtering in the current state."
+        _set_error(msg)
+        return False, msg
+    return True, ""
+
+
+def _try_vent(value=None):
+    if sm.transition("VENTING"):
+        return True, ""
+    return False, "Cannot vent in the current state."
+
+
+def _try_estop(value=None):
+    """Routes through _force_safe_shutdown(), NOT bare emergency_stop():
+    the turbo valve GPIO is otherwise only written by the poll loop's next
+    tick, so a plain emergency_stop() silently depends on the poll thread
+    being alive to actually close the valve. E-STOP must be unconditional.
+    Consequence: E-STOP now LATCHES (banner + Clear Fault to resume) --
+    the commercially-correct semantics; an EMO requires an explicit reset.
+    """
+    _force_safe_shutdown("E-STOP pressed by operator.")
+    return True, "E-STOP executed — latched; Clear Fault to resume."
+
 
 def _complete_plasma_confirmation(source):
     """Shared by the manual Confirm Plasma button and the PZEM auto-confirm
@@ -684,13 +748,16 @@ def _complete_plasma_confirmation(source):
     return False
 
 
-def _on_confirm_plasma():
+def _try_confirm_plasma(value=None, source="operator"):
     """Operator manually confirms plasma is ignited; proceed to SPUTTER_READY."""
-    if not _complete_plasma_confirmation("operator"):
-        _set_error("Cannot confirm plasma in current state.")
+    if _complete_plasma_confirmation(source):
+        return True, ""
+    msg = "Cannot confirm plasma in current state."
+    _set_error(msg)
+    return False, msg
 
 
-def _on_confirm_vent_complete():
+def _try_confirm_vent_complete(value=None):
     """Operator confirms the primary/roughing pump has been turned off.
     Unblocks the VENTING -> IDLE transition (and therefore the turbo inlet
     valve re-closing, see turbo_valve_step()) that _poll() otherwise holds
@@ -700,12 +767,13 @@ def _on_confirm_vent_complete():
     """
     with _lock:
         if not _state["vent_complete_pending"]:
-            return
+            return False, "No vent completion pending."
         _state["vent_complete_confirmed"] = True
     _log_event("Vent complete confirmed by operator (primary pump off).")
+    return True, ""
 
 
-def _on_toggle_auto_confirm():
+def _try_toggle_auto_confirm(value=None):
     """Operator opt-in: when armed, a PZEM-confirmed plasma detection during
     PLASMA_IGNITING auto-advances to SPUTTER_READY (see _poll()) instead of
     requiring the Confirm Plasma click. Off by default -- the PZEM current
@@ -716,30 +784,98 @@ def _on_toggle_auto_confirm():
         _state["pzem_auto_confirm"] = not _state["pzem_auto_confirm"]
         enabled = _state["pzem_auto_confirm"]
     _log_event(f"PZEM auto-confirm {'armed' if enabled else 'disarmed'} by operator.")
+    return True, ""
 
 
-_sim_plasma_strike_on = False
-
-
-def _on_toggle_sim_plasma_strike():
+def _try_toggle_sim_plasma_strike(value=None):
     """SIM_MODE only: manually toggles the simulated variac current --
     see ChamberSim.set_plasma_struck(). Deliberately manual rather than
     automatic: _ignite_plasma() is still a stub on real hardware too, so
     nothing decides this automatically there either; a first attempt at
     an automatic flow+pressure heuristic in the simulation fired during
     ARGON_FLUSH itself (before any real ignition attempt), which was
-    wrong. Button is only created/gridded when SIM_MODE is on.
+    wrong. State lives in _state["sim_plasma_strike"] (the button text is
+    updated by _refresh(), same pattern as the Auto-Confirm toggle) so
+    this stays callable from any thread.
     """
-    global _sim_plasma_strike_on
     if _sim_chamber is None:
-        return
-    _sim_plasma_strike_on = not _sim_plasma_strike_on
-    _sim_chamber.set_plasma_struck(_sim_plasma_strike_on)
-    if btn_sim_plasma_strike is not None:
-        btn_sim_plasma_strike.config(
-            text=f"Plasma Strike (SIM): {'ON' if _sim_plasma_strike_on else 'OFF'}",
-            bg="#FFA500" if _sim_plasma_strike_on else "#dddddd",
+        return False, "Not running in simulation mode."
+    with _lock:
+        _state["sim_plasma_strike"] = not _state["sim_plasma_strike"]
+        on = _state["sim_plasma_strike"]
+    _sim_chamber.set_plasma_struck(on)
+    _log_event(f"SIM plasma strike toggled {'ON' if on else 'OFF'}.")
+    return True, ""
+
+
+def _try_set_sputter_target(raw):
+    """Validate + apply an operator-entered sputter target pressure (mbar).
+    Same bounds as always -- see SPUTTER_TARGET_MAX_MBAR's config comment
+    for the swapped-field reasoning. Returns (ok, message)."""
+    try:
+        v = float(str(raw).strip())
+    except (ValueError, TypeError):
+        msg = "Invalid sputter target; enter pressure in mbar."
+        _set_error(msg)
+        return False, msg
+    if v <= 0.0:
+        msg = "Sputter target must be > 0 mbar."
+        _set_error(msg)
+        return False, msg
+    if v > SPUTTER_TARGET_MAX_MBAR:
+        msg = f"Sputter target {v:.4f} mbar exceeds the {SPUTTER_TARGET_MAX_MBAR:.2f} mbar limit."
+        _set_error(msg)
+        return False, msg
+    with _lock:
+        _state["sputter_target_mbar"] = v
+    _set_error("")
+    return True, ""
+
+
+def _try_set_argon_psi(raw):
+    """Validate + apply an operator-entered argon regulator pressure (psi).
+    Returns (ok, message)."""
+    try:
+        v = float(str(raw).strip())
+    except (ValueError, TypeError):
+        msg = "Invalid argon pressure; enter a number in psi."
+        _set_error(msg)
+        return False, msg
+    if v < ARGON_PRESSURE_MIN_PSI:
+        msg = f"Argon pressure {v:.2f} psi is below the {ARGON_PRESSURE_MIN_PSI:.0f} psi minimum."
+        _set_error(msg)
+        return False, msg
+    with _lock:
+        _state["argon_pressure"] = v
+    _set_error("")
+    return True, ""
+
+
+# ── Tkinter wrappers: local-operator modal dialogs only ──
+def _on_start_argon_flush():
+    ok, _ = _argon_guard("argon flush")
+    if not ok:
+        with _lock:
+            argon_pressure = _state["argon_pressure"]
+        messagebox.showwarning(
+            "Argon pressure low",
+            f"Argon pressure is {argon_pressure:.1f} psi. "
+            f"Increase it to at least {ARGON_PRESSURE_MIN_PSI:.0f} psi before starting argon flush."
         )
+    _try_start_argon_flush()
+
+
+def _on_start_sputter():
+    ok, _ = _argon_guard("sputtering")
+    if not ok:
+        with _lock:
+            argon_pressure = _state["argon_pressure"]
+        messagebox.showwarning(
+            "Argon pressure low",
+            f"Argon pressure is {argon_pressure:.1f} psi. "
+            f"Increase it to at least {ARGON_PRESSURE_MIN_PSI:.0f} psi before starting sputtering."
+        )
+    _try_start_sputter()
 
 # ════════════════════════════════════════════════════════
 #  POLLING THREAD
@@ -762,6 +898,13 @@ def _poll():
     pzem_confirm_ticks = 0           # For plasma_detect_step
     pzem_absent_since = None         # For pzem_plasma_absent_check
     pzem_unexpected_since = None     # For pzem_power_unexpected_check
+    pzem_ever_ready = False          # For the meter-lost alert below: latches True on
+                                     # the meter's first successful read, so a meter
+                                     # that was never attached stays silent (optional
+                                     # hardware) but one that WAS working and vanished
+                                     # alarms -- level-checked, not edge-checked, so
+                                     # entering a plasma state with the meter already
+                                     # gone still alarms (an edge check missed that)
     while not _stop_event.is_set():
         start_time = time.time()  # Track start time for precise loop interval timing
         try:
@@ -781,6 +924,21 @@ def _poll():
             plasma_detected, pzem_confirm_ticks = plasma_detect_step(
                 e["current"], plasma_detected, pzem_confirm_ticks)
 
+            # Monitoring that silently disarms is worse than no monitoring:
+            # the PZEM cross-sensor checks below only evaluate while
+            # e["ready"] (correct for a meter that was never installed), so
+            # a once-working meter that is gone during ANY plasma-expected
+            # tick (died mid-state, or died earlier and the process then
+            # advanced into a plasma state) must be called out loudly, not
+            # just shown as a red label in one panel. Level-checked every
+            # tick while the condition persists; _set_error de-dupes the
+            # repeated log line.
+            if e["ready"]:
+                pzem_ever_ready = True
+            elif pzem_ever_ready and current in _PZEM_PLASMA_EXPECTED_STATES:
+                _set_error(f"PZEM energy meter lost during {current} — plasma current "
+                           "monitoring is INACTIVE; check the USB/serial connection.")
+
             if current == "IDLE":
                 p = pirani.read(auto_opto=False)
                 pirani.set_opto(False)
@@ -797,7 +955,7 @@ def _poll():
             elif current == "PUMP_DOWN":
                 p = pirani.read(auto_opto=False)
                 # Transition-based opto: fire HIGH only when voltage first drops below 1.3 V
-                if not p["opto_enabled"] and p["voltage"] <= 1.3:
+                if not p["opto_enabled"] and p["voltage"] <= 1.4:
                     pirani.set_opto(True)
                     p["opto_enabled"] = True
                 mfc.set_flow(0.0)
@@ -832,8 +990,18 @@ def _poll():
                 with _lock:
                     t_start = _state["plasma_ignition_start"]
                     auto_confirm_armed = _state["pzem_auto_confirm"]
-                # Auto-abort if plasma not confirmed within timeout
-                if t_start is not None and (time.time() - t_start) >= PLASMA_IGNITION_TIMEOUT:
+                # Auto-confirm is checked BEFORE the timeout: if a debounced
+                # detection lands on the same tick the 120s expires, cutting
+                # gas under a just-lit plasma (what timeout-first did) is the
+                # wrong resolution -- a confirmed detection beats a timer.
+                if auto_confirm_armed and plasma_detected:
+                    # Operator-armed (Auto-Confirm toggle, off by default): a
+                    # debounced PZEM current-draw detection advances the
+                    # state machine the same way the operator's Confirm
+                    # Plasma click does — see _complete_plasma_confirmation().
+                    _complete_plasma_confirmation("PZEM auto-confirm")
+                elif t_start is not None and (time.time() - t_start) >= PLASMA_IGNITION_TIMEOUT:
+                    # Auto-abort: plasma never confirmed within the timeout
                     mfc.set_flow(0.0)
                     mfc.valve_close()
                     sm.transition("READY")
@@ -841,12 +1009,6 @@ def _poll():
                         _state["plasma_ignition_start"] = None
                         _state["plasma_ignition_triggered"] = False
                     _set_error("Plasma ignition timed out; returned to READY.")
-                elif auto_confirm_armed and plasma_detected:
-                    # Operator-armed (Auto-Confirm toggle, off by default): a
-                    # debounced PZEM current-draw detection advances the
-                    # state machine the same way the operator's Confirm
-                    # Plasma click does — see _complete_plasma_confirmation().
-                    _complete_plasma_confirmation("PZEM auto-confirm")
             elif current == "SPUTTER_READY":
                 p = pirani.read(auto_opto=True)
                 mfc.valve_release()
@@ -870,13 +1032,17 @@ def _poll():
                 mfc.valve_close()  # Keep MFC valve closed throughout venting
                 pirani.set_opto(False)
                 # Reaching atmosphere alone does not complete the vent -- see
-                # vent_complete_ready(). Recomputed fresh every tick so the
-                # pending flag tracks the live pressure reading (e.g. clears
-                # itself if pressure were to dip back below atmosphere).
+                # vent_complete_ready(). Latches True on first crossing
+                # VENTING_COMPLETE_VOLTAGE and never clears back to False on
+                # its own -- a noisy/borderline reading dipping back under
+                # the threshold on some later tick must not make the
+                # "Confirm Pump Off" button flicker in and out.
                 with _lock:
+                    if p["voltage"] >= VENTING_COMPLETE_VOLTAGE:
+                        _state["vent_complete_pending"] = True
+                    vent_complete_pending = _state["vent_complete_pending"]
                     vent_complete_confirmed = _state["vent_complete_confirmed"]
-                    _state["vent_complete_pending"] = p["voltage"] >= VENTING_COMPLETE_VOLTAGE
-                if vent_complete_ready(p["voltage"], vent_complete_confirmed):
+                if vent_complete_ready(vent_complete_pending, vent_complete_confirmed):
                     if sm.transition("IDLE"):
                         with _lock:
                             _state["vent_complete_pending"] = False
@@ -1086,6 +1252,26 @@ ip_frame = tk.Frame(root)
 ip_frame.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 0), sticky="ew")
 tk.Label(ip_frame, text="Pi IP  :", font=("Courier", 13, "bold")).pack(side="left")
 tk.Label(ip_frame, text=_get_ip(), font=("Courier", 13), fg="blue").pack(side="left")
+if WEB_UI_ENABLED:
+    # Explicit http:// scheme, in a READONLY ENTRY (selectable, unlike a
+    # Label) plus a one-click Copy button: browsers with HTTPS-Only mode
+    # rewrite a bare ip:port to https:// and fail against this plain-HTTP
+    # server, so operators need to carry the scheme along when pasting.
+    _web_url = f"http://{_get_ip()}:{WEB_UI_PORT}"
+    tk.Label(ip_frame, text="   Web UI:", font=("Courier", 13, "bold")).pack(side="left")
+    _web_url_entry = tk.Entry(ip_frame, font=("Courier", 13), fg="green",
+                              width=len(_web_url) + 1, relief="flat",
+                              readonlybackground=root.cget("bg"))
+    _web_url_entry.insert(0, _web_url)
+    _web_url_entry.config(state="readonly")
+    _web_url_entry.pack(side="left")
+
+    def _copy_web_url():
+        root.clipboard_clear()
+        root.clipboard_append(_web_url)
+
+    tk.Button(ip_frame, text="Copy", font=("Courier", 11),
+              command=_copy_web_url).pack(side="left", padx=(4, 0))
 if SIM_MODE:
     # Unmistakable, always-visible: never let a simulated run be confused
     # with real hardware control.
@@ -1110,7 +1296,7 @@ lbl_safety_trip = tk.Label(
 )
 btn_clear_fault = tk.Button(
     sf, text="Clear Fault", font=("Courier", 12, "bold"),
-    fg="white", bg="red", command=lambda: _on_clear_fault()
+    fg="white", bg="red", command=lambda: _try_clear_fault()
 )
 
 # Status/error bar — lives in the Process State frame (row 3, below the
@@ -1139,7 +1325,7 @@ btn_confirm_plasma = tk.Button(
     text="Confirm Plasma",
     width=16,
     font=("Courier", 12),
-    command=_on_confirm_plasma
+    command=lambda: _try_confirm_plasma()
 )
 _confirm_plasma_default_bg = btn_confirm_plasma.cget("bg")  # restored in _refresh() once
                                                              # PZEM stops confirming detection
@@ -1157,7 +1343,7 @@ btn_stop = tk.Button(
     text="Stop Sputter",
     width=16,
     font=("Courier", 12),
-    command=lambda: sm.transition("VENTING")
+    command=lambda: _try_vent()
 )
 
 btn_vent = tk.Button(
@@ -1165,17 +1351,17 @@ btn_vent = tk.Button(
     text="Vent",
     width=16,
     font=("Courier", 12),
-    command=lambda: sm.transition("VENTING")
+    command=lambda: _try_vent()
 )
 
 # Hidden (grid_remove) unless vent_complete_pending -- see
-# vent_complete_ready() / _on_confirm_vent_complete(). Atmospheric pressure
+# vent_complete_ready() / _try_confirm_vent_complete(). Atmospheric pressure
 # alone no longer completes a vent; this is the explicit acknowledgment
 # gate that unblocks it, so the turbo inlet valve can't reclose before the
 # operator has actually turned off the primary/roughing pump.
 btn_confirm_vent = tk.Button(
     bf, text="Confirm Pump Off", width=16, font=("Courier", 12, "bold"),
-    fg="white", bg="#FFA500", command=lambda: _on_confirm_vent_complete()
+    fg="white", bg="#FFA500", command=lambda: _try_confirm_vent_complete()
 )
 
 btn_estop = tk.Button(
@@ -1185,16 +1371,16 @@ btn_estop = tk.Button(
     font=("Courier", 12, "bold"),
     fg="white",
     bg="red",
-    command=sm.emergency_stop
+    command=lambda: _try_estop()
 )
 
 # SIM_MODE only: manual control over the simulated variac current -- see
-# ChamberSim.set_plasma_struck() / _on_toggle_sim_plasma_strike().
+# ChamberSim.set_plasma_struck() / _try_toggle_sim_plasma_strike().
 btn_sim_plasma_strike = None
 if SIM_MODE:
     btn_sim_plasma_strike = tk.Button(
         bf, text="Plasma Strike (SIM): OFF", width=34, font=("Courier", 12, "bold"),
-        fg="black", bg="#dddddd", command=lambda: _on_toggle_sim_plasma_strike()
+        fg="black", bg="#dddddd", command=lambda: _try_toggle_sim_plasma_strike()
     )
 
 btn_flush          .grid(row=0, column=0, padx=4, pady=4)
@@ -1294,7 +1480,7 @@ lbl_plasma_detected = tk.Label(plf, text="PLASMA  : ——", font=("Courier", 16
                                anchor="w", width=30)
 btn_auto_confirm = tk.Button(
     plf, text="Auto-Confirm: OFF", font=("Courier", 11, "bold"),
-    fg="black", bg="#dddddd", command=lambda: _on_toggle_auto_confirm()
+    fg="black", bg="#dddddd", command=lambda: _try_toggle_auto_confirm()
 )
 lbl_plasma_detected.grid(row=0, column=0, sticky="w")
 btn_auto_confirm   .grid(row=0, column=1, sticky="e", padx=(6, 0))
@@ -1373,7 +1559,7 @@ t_graph = ScrollingGraph(t_canvas, maxlen=GRAPH_MAX_SAMPLES,
 # Button order: flush, confirm_plasma, sputter, stop, vent, estop
 BUTTON_STATES = {
     "IDLE":            ("disabled", "disabled", "disabled", "disabled", "disabled", "normal"),
-    "PUMP_DOWN":       ("disabled", "disabled", "disabled", "disabled", "disabled", "normal"),
+    "PUMP_DOWN":       ("disabled", "disabled", "disabled", "disabled", "normal",   "normal"),
     "READY":           ("normal",   "disabled", "disabled", "disabled", "normal",   "normal"),
     "ARGON_FLUSH":     ("disabled", "disabled", "disabled", "disabled", "normal",   "normal"),
     "PLASMA_IGNITING": ("disabled", "normal",   "disabled", "disabled", "normal",   "normal"),
@@ -1388,48 +1574,37 @@ BUTTON_STATES = {
 # ════════════════════════════════════════════════════════
 
 def _update_sputter_target():
+    """Tk wrapper around _try_set_sputter_target(): reads the Entry widget
+    and adds the local modal for the swapped-field (over-cap) case. The
+    'Set:' label itself is refreshed from _state by _refresh(), so values
+    set from the web dashboard show up here too."""
     raw = entry_sputter_target.get().strip()
     try:
         v = float(raw)
     except ValueError:
-        _set_error("Invalid sputter target; enter pressure in mbar.")
-        return
-    if v <= 0.0:
-        _set_error("Sputter target must be > 0 mbar.")
-        return
-    if v > SPUTTER_TARGET_MAX_MBAR:
+        v = None
+    if v is not None and v > SPUTTER_TARGET_MAX_MBAR:
         messagebox.showwarning(
             "Sputter target too high",
             f"{v:.4f} mbar exceeds the {SPUTTER_TARGET_MAX_MBAR:.2f} mbar limit for Sputter P.\n"
             "Check you didn't enter an Argon PSI value in this field."
         )
-        _set_error(f"Sputter target {v:.4f} mbar exceeds the {SPUTTER_TARGET_MAX_MBAR:.2f} mbar limit.")
-        return
-    with _lock:
-        _state["sputter_target_mbar"] = v
-    _set_error("")
-    lbl_sputter_set_val.config(text=f"Set: {v:.4f} mbar")
+    _try_set_sputter_target(raw)
 
 def _update_argon_pressure():
+    """Tk wrapper around _try_set_argon_psi() -- see _update_sputter_target."""
     raw_value = entry_argon.get().strip()
     try:
         value = float(raw_value)
     except ValueError:
-        _set_error("Invalid argon pressure; enter a number in psi.")
-        return
-    if value < ARGON_PRESSURE_MIN_PSI:
+        value = None
+    if value is not None and value < ARGON_PRESSURE_MIN_PSI:
         messagebox.showwarning(
             "Argon pressure too low",
             f"{value:.2f} psi is below the {ARGON_PRESSURE_MIN_PSI:.0f} psi minimum for Argon PSI.\n"
             "Check you didn't enter a Sputter P value in this field."
         )
-        _set_error(f"Argon pressure {value:.2f} psi is below the {ARGON_PRESSURE_MIN_PSI:.0f} psi minimum.")
-        return
-
-    with _lock:
-        _state["argon_pressure"] = value
-    _set_error("")
-    lbl_argon_set_val.config(text=f"Set: {value:.1f} psi")
+    _try_set_argon_psi(raw_value)
 
 
 def _ignite_plasma():
@@ -1440,6 +1615,47 @@ def _ignite_plasma():
     """
     # TODO: implement RF trigger/control logic when hardware is defined
     pass
+
+
+def _process_message(s):
+    """Contextual operator-guidance line for the current state -- shared by
+    the Tkinter Pirani panel (_refresh) and the web dashboard snapshot
+    (web_ui), so both UIs always say the same thing. Takes a copied _state
+    snapshot; returns (message, color)."""
+    st = s["sm_state"]
+    color = "blue"
+    if st == "IDLE":
+        msg = "IDLE: MFC valve closed, turbo opto off."
+    elif st == "PUMP_DOWN":
+        if s["opto_enabled"]:
+            msg = "Turbo opto ON at {:.4f} V; pump down continues.".format(s["pirani_voltage"])
+        else:
+            msg = "Pump down in progress; turbo opto will enable when pressure drops sufficiently."
+    elif st == "READY":
+        msg = "READY: Start Argon Flush once inlet pressure is ≥ 15 psi."
+    elif st == "ARGON_FLUSH":
+        if s["pirani_voltage"] >= ARGON_FLUSH_TARGET_VOLTAGE:
+            msg = "Target 0.09 mbar reached; igniting plasma automatically."
+        else:
+            msg = "Argon flush: controlling flow to reach 0.09 mbar (now {:.3f} V).".format(s["pirani_voltage"])
+    elif st == "PLASMA_IGNITING":
+        elapsed = time.time() - s["plasma_ignition_start"] if s["plasma_ignition_start"] else 0
+        remaining = max(0, int(PLASMA_IGNITION_TIMEOUT - elapsed))
+        msg = f"Waiting for plasma ignition ({remaining}s remaining). Confirm or wait for auto-abort."
+    elif st == "SPUTTER_READY":
+        msg = "SPUTTER READY: Plasma stable at target pressure. Press Start Sputter."
+    elif st == "VENTING":
+        if s["vent_complete_pending"]:
+            msg = "Atmosphere reached — turn OFF the primary/roughing pump, then click Confirm Pump Off."
+            color = "red"
+        elif s["turbo_rpm"] <= VENTING_PUMP_OFF_PROMPT_RPM:
+            msg = "Turbo has spun down — turn OFF the primary/roughing pump now."
+            color = "#FFA500"
+        else:
+            msg = f"Venting: turbo at {s['turbo_rpm']:.0f} RPM, waiting for it to spin down."
+    else:
+        msg = ""
+    return msg, color
 
 
 # Tracks the currently displayed error and when it first appeared (GUI thread only)
@@ -1516,6 +1732,17 @@ def _refresh():
         bg   = "#FFA500"           if s["pzem_auto_confirm"] else "#dddddd",
     )
 
+    if btn_sim_plasma_strike is not None:
+        btn_sim_plasma_strike.config(
+            text=f"Plasma Strike (SIM): {'ON' if s['sim_plasma_strike'] else 'OFF'}",
+            bg="#FFA500" if s["sim_plasma_strike"] else "#dddddd",
+        )
+
+    # Set-value labels track _state (not just the local Entry handlers), so
+    # values set from the web dashboard show up here too.
+    lbl_sputter_set_val.config(text=f"Set: {s['sputter_target_mbar']:.4f} mbar")
+    lbl_argon_set_val.config(text=f"Set: {s['argon_pressure']:.1f} psi")
+
     # Confirm Pump Off — shown only while atmospheric pressure has been
     # reached during VENTING but the operator hasn't yet confirmed the
     # primary/roughing pump is off (see vent_complete_ready()). Same
@@ -1570,39 +1797,7 @@ def _refresh():
     })
     pzem_graph.draw()
 
-    p_message_color = "blue"
-    if st == "IDLE":
-        p_message = "IDLE: MFC valve closed, turbo opto off."
-    elif st == "PUMP_DOWN":
-        if s["opto_enabled"]:
-            p_message = "Turbo opto ON at {:.4f} V; pump down continues.".format(s["pirani_voltage"])
-        else:
-            p_message = "Pump down in progress; turbo opto will enable when pressure drops sufficiently."
-    elif st == "READY":
-        p_message = "READY: Start Argon Flush once inlet pressure is ≥ 15 psi."
-    elif st == "ARGON_FLUSH":
-        if s["pirani_voltage"] >= ARGON_FLUSH_TARGET_VOLTAGE:
-            p_message = "Target 0.09 mbar reached; igniting plasma automatically."
-        else:
-            p_message = "Argon flush: controlling flow to reach 0.09 mbar (now {:.3f} V).".format(s["pirani_voltage"])
-    elif st == "PLASMA_IGNITING":
-        elapsed = time.time() - s["plasma_ignition_start"] if s["plasma_ignition_start"] else 0
-        remaining = max(0, int(PLASMA_IGNITION_TIMEOUT - elapsed))
-        p_message = f"Waiting for plasma ignition ({remaining}s remaining). Confirm or wait for auto-abort."
-    elif st == "SPUTTER_READY":
-        p_message = "SPUTTER READY: Plasma stable at target pressure. Press Start Sputter."
-    elif st == "VENTING":
-        if s["vent_complete_pending"]:
-            p_message = "Atmosphere reached — turn OFF the primary/roughing pump, then click Confirm Pump Off."
-            p_message_color = "red"
-        elif s["turbo_rpm"] <= VENTING_PUMP_OFF_PROMPT_RPM:
-            p_message = "Turbo has spun down — turn OFF the primary/roughing pump now."
-            p_message_color = "#FFA500"
-        else:
-            p_message = f"Venting: turbo at {s['turbo_rpm']:.0f} RPM, waiting for it to spin down."
-    else:
-        p_message = ""
-
+    p_message, p_message_color = _process_message(s)
     lbl_p_message.config(text=p_message, fg=p_message_color)
     p_graph.push(s["pirani_voltage"])
     p_graph.draw()
@@ -1666,6 +1861,93 @@ def _on_close():
 
 
 root.protocol("WM_DELETE_WINDOW", _on_close)
+
+
+# ════════════════════════════════════════════════════════
+#  WEB DASHBOARD (parallel view -- see web_ui.py)
+# ════════════════════════════════════════════════════════
+# Started last, once every handler and BUTTON_STATES exist: a request can
+# arrive the instant the port binds. The Tkinter GUI above runs regardless
+# of anything that happens here -- deliberately, so a network problem can
+# only ever cost the browser page, never the local UI (the fallback of
+# record on the rig).
+
+def _web_snapshot():
+    """JSON-ready copy of live state plus the derived values both UIs
+    show: pressure in mbar, the contextual guidance line, and per-button
+    enabled flags (same BUTTON_STATES table the Tk buttons use)."""
+    with _lock:
+        s = dict(_state)
+    s["pressure_mbar"] = adc_voltage_to_mbar(s["pirani_voltage"])
+    s["p_message"], s["p_message_color"] = _process_message(s)
+    s["sim_mode"] = SIM_MODE
+    s["server_time"] = time.time()
+
+    # Redundant copy of _refresh()'s poll-heartbeat watchdog: the GUI
+    # thread is the primary watcher, but if the GUI has died AND the poll
+    # loop then hangs, a connected browser is the only thread left looking.
+    # _force_safe_shutdown() is idempotent + de-duped, so firing from every
+    # snapshot tick while the stall persists is safe.
+    stall = s["server_time"] - s["last_tick"]
+    if stall > HEARTBEAT_TIMEOUT_SECONDS:
+        _force_safe_shutdown(
+            f"Poll loop stalled (no update in {stall:.1f}s) — web watchdog."
+        )
+    # Graph scale ranges ride along so the page never duplicates config.py
+    # values (they'd silently drift apart otherwise).
+    s["graph"] = {
+        "samples": GRAPH_MAX_SAMPLES,
+        "pirani":  [GRAPH_PIRANI_MIN, GRAPH_PIRANI_MAX],
+        "mfc":     [GRAPH_MFC_MIN, GRAPH_MFC_MAX],
+        "dac":     [0.0, ARGON_DAC_VREF],
+        "rpm":     [GRAPH_TURBO_RPM_MIN, GRAPH_TURBO_RPM_MAX],
+        "pzem_v":  [0.0, GRAPH_PZEM_VOLTAGE_MAX],
+        "pzem_i":  [0.0, GRAPH_PZEM_CURRENT_MAX],
+        "pzem_p":  [0.0, GRAPH_PZEM_POWER_MAX],
+        "pzem_hz": [GRAPH_PZEM_FREQ_MIN, GRAPH_PZEM_FREQ_MAX],
+        "pzem_pf": [0.0, 1.0],
+    }
+    bs = BUTTON_STATES.get(s["sm_state"], BUTTON_STATES["IDLE"])
+    s["buttons"] = {
+        "start_flush":    bs[0] == "normal",
+        "confirm_plasma": bs[1] == "normal",
+        "start_sputter":  bs[2] == "normal",
+        "stop_sputter":   bs[3] == "normal",
+        "vent":           bs[4] == "normal",
+        "estop":          bs[5] == "normal",
+    }
+    return s
+
+
+_WEB_COMMANDS = {
+    # Exactly the same functions the Tkinter buttons call -- same guards,
+    # same locks, same audit log (see the OPERATOR COMMANDS section).
+    "start_flush":        _try_start_argon_flush,
+    "confirm_plasma":     lambda v: _try_confirm_plasma(source="web operator"),
+    "start_sputter":      _try_start_sputter,
+    "stop_sputter":       _try_vent,
+    "vent":               _try_vent,
+    "estop":              _try_estop,
+    "clear_fault":        _try_clear_fault,
+    "confirm_vent":       _try_confirm_vent_complete,
+    "toggle_auto_confirm": _try_toggle_auto_confirm,
+    "sim_plasma_strike":  _try_toggle_sim_plasma_strike,
+    "set_sputter_target": _try_set_sputter_target,
+    "set_argon_psi":      _try_set_argon_psi,
+}
+
+if WEB_UI_ENABLED:
+    import web_ui
+    _web_server = web_ui.WebUI(
+        get_snapshot=_web_snapshot,
+        commands=_WEB_COMMANDS,
+        page_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html"),
+        port=WEB_UI_PORT,
+        update_interval=WEB_UI_UPDATE_INTERVAL,
+        log=_log_event,
+    )
+    _web_server.start()  # a failed bind logs + returns; the app runs on
+
 
 _refresh()
 # Lock resizing only now that every widget above has been created and
