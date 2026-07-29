@@ -204,7 +204,7 @@ SENSOR_RANGE_CONFIRM_SAMPLES = 5       # Consecutive out-of-range reads
 # ════════════════════════════════════════════════════════
 # Reads AC voltage/current/power/energy/frequency/power-factor on the
 # sputtering supply's variac output via a CP2102 USB-TTL adapter (Modbus-
-# RTU, see pzem_meter.py). Optional hardware: unlike the ADS1115/MCP4725
+# RTU, see drivers/pzem_meter.py). Optional hardware: unlike the ADS1115/MCP4725
 # checked in main.py's startup self-test, this sensor may not be wired up
 # yet -- PZEMController never raises and reports ready=False until a real
 # meter responds, so nothing here fires (see main.py's `if e["ready"]:`
@@ -323,7 +323,7 @@ GRAPH_TURBO_RPM_COLOR = "#FF00FF"  # magenta
 # ════════════════════════════════════════════════════════
 #  WEB DASHBOARD (browser view, parallel to the Tkinter GUI)
 # ════════════════════════════════════════════════════════
-WEB_UI_ENABLED = True    # Serve the browser dashboard (web_ui.py). The local
+WEB_UI_ENABLED = True    # Serve the browser dashboard (ui/web_ui.py). The local
                          # Tkinter GUI always runs regardless -- the web UI is
                          # a second view of the same process, never a
                          # replacement, so network loss only costs the browser

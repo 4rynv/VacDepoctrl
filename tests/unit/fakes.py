@@ -231,7 +231,7 @@ def load_main_slice(repo_root, overrides=None):
     import config
     src = open(os.path.join(repo_root, "main.py")).read()
     start = src.index("_PIRANI_CAL = [")
-    end = src.index("from pirani")
+    end = src.index("from drivers.pirani")
     # turbo_valve_step / cross-sensor / global-gate functions in this slice
     # reference config globals at call time -- inject every constant
     # (config.py holds nothing but ALL_CAPS constants) so new ones don't

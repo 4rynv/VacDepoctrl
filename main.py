@@ -9,12 +9,12 @@ import sys
 
 # Simulation mode: SPUTTER_SIM=1 python main.py, or python main.py --sim.
 # Installs fake hardware modules into sys.modules BEFORE the real ones are
-# imported below -- see sim_hardware.py. Everything else in this file runs
+# imported below -- see sim/sim_hardware.py. Everything else in this file runs
 # completely unmodified against them; nothing downstream needs to know.
 SIM_MODE = os.environ.get("SPUTTER_SIM") == "1" or "--sim" in sys.argv
 _sim_chamber = None
 if SIM_MODE:
-    import sim_hardware
+    from sim import sim_hardware
     _sim_chamber = sim_hardware.install()
 
 # Single-instance lock, taken BEFORE any hardware is touched: two instances
@@ -417,12 +417,12 @@ def config_sanity_failures():
         )
     return failures
 
-from pirani        import PiraniController
-from mfc_control   import MFCController
-from turbo_rpm     import TurboRPMController
-from pzem_meter    import PZEMController
-from state_machine import SputterStateMachine, STATE_COLORS
-from graph         import ScrollingGraph
+from drivers.pirani      import PiraniController
+from drivers.mfc_control import MFCController
+from drivers.turbo_rpm   import TurboRPMController
+from drivers.pzem_meter  import PZEMController
+from state_machine       import SputterStateMachine, STATE_COLORS
+from ui.graph            import ScrollingGraph
 
 
 # ════════════════════════════════════════════════════════
@@ -465,7 +465,7 @@ ads.gain = ADC_GAIN
 pirani    = PiraniController(ads)
 mfc       = MFCController(ads, i2c=i2c)
 turbo_rpm = TurboRPMController(ads)
-pzem      = PZEMController()  # optional hardware — see pzem_meter.py; never blocks startup
+pzem      = PZEMController()  # optional hardware — see drivers/pzem_meter.py; never blocks startup
 sm        = SputterStateMachine()
 
 def _startup_self_test():
@@ -660,7 +660,7 @@ def _force_safe_shutdown(reason):
 # ════════════════════════════════════════════════════════
 # Every operator command is a _try_*() function returning (ok, message) --
 # shared verbatim by the Tkinter buttons and the web dashboard
-# (web_ui.py), so a browser click and a local click go through the exact
+# (ui/web_ui.py), so a browser click and a local click go through the exact
 # same guards, locks, and audit logging. None of these touch Tkinter
 # (messagebox/widgets): they are safe to call from the web server's
 # request threads, the same way the Tk button callbacks already run on a
@@ -1864,7 +1864,7 @@ root.protocol("WM_DELETE_WINDOW", _on_close)
 
 
 # ════════════════════════════════════════════════════════
-#  WEB DASHBOARD (parallel view -- see web_ui.py)
+#  WEB DASHBOARD (parallel view -- see ui/web_ui.py)
 # ════════════════════════════════════════════════════════
 # Started last, once every handler and BUTTON_STATES exist: a request can
 # arrive the instant the port binds. The Tkinter GUI above runs regardless
@@ -1937,11 +1937,11 @@ _WEB_COMMANDS = {
 }
 
 if WEB_UI_ENABLED:
-    import web_ui
+    from ui import web_ui
     _web_server = web_ui.WebUI(
         get_snapshot=_web_snapshot,
         commands=_WEB_COMMANDS,
-        page_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html"),
+        page_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "web", "index.html"),
         port=WEB_UI_PORT,
         update_interval=WEB_UI_UPDATE_INTERVAL,
         log=_log_event,

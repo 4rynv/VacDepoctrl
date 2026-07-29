@@ -5,7 +5,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pzem_meter import PZEMController
+from drivers.pzem_meter import PZEMController
 
 # -----------------------------------
 # Bench script: live PZEM-004T-100A readings over the CP2102 USB-TTL

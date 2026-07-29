@@ -1,11 +1,11 @@
 #!/bin/bash
 # Builds two double-clickable macOS .app launchers and installs them on the
-# Desktop -- the Mac equivalent of Sputter_ctrl.desktop on the Pi:
+# Desktop -- the Mac equivalent of VacDepoctrl.desktop on the Pi:
 #
-#   Sputter Simulation.app  -- runs main.py locally with SPUTTER_SIM=1,
+#   VacDep Simulation.app   -- runs main.py locally with SPUTTER_SIM=1,
 #                               no Pi or hardware needed (see README's
-#                               Simulation Mode notes / sim_hardware.py).
-#   Sputter Remote.app      -- picks a rig (see RIGS below), SSHes in with
+#                               Simulation Mode notes / sim/sim_hardware.py).
+#   VacDep Remote.app       -- picks a rig (see RIGS below), SSHes in with
 #                               X11 forwarding, and launches the real
 #                               main.py there (see README's Remote GUI
 #                               Access section).
@@ -14,15 +14,15 @@
 # startup self-test prints failures to the console before any GUI window
 # exists -- a silently-failing launch with no visible error is a real
 # usability problem for this kind of hardware-control app (same reasoning
-# as Terminal=true in Sputter_ctrl.desktop on the Pi side).
+# as Terminal=true in VacDepoctrl.desktop on the Pi side).
 set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ICNS="$REPO_DIR/Docs/AppIcon.icns"
+ICNS="$REPO_DIR/assets/AppIcon.icns"
 DESKTOP="$HOME/Desktop"
 
 if [ ! -f "$ICNS" ]; then
-	echo "Docs/AppIcon.icns not found -- generate it first (see Docs/app-icon-1024.png)."
+	echo "assets/AppIcon.icns not found -- generate it first (see assets/app-icon-1024.png)."
 	exit 1
 fi
 
@@ -61,8 +61,8 @@ PLIST
 	echo "$app_dir"
 }
 
-echo "==> Building Sputter Simulation.app..."
-SIM_APP_DIR="$(scaffold_app "Sputter Simulation" "com.aryanv.sputterctrl.sim")"
+echo "==> Building VacDep Simulation.app..."
+SIM_APP_DIR="$(scaffold_app "VacDep Simulation" "com.aryanv.vacdepoctrl.sim")"
 # osascript reads the script from stdin (heredoc) rather than a -e '...'
 # argument -- an earlier version embedded the shell command directly into
 # a single-quoted -e argument, which silently stripped any single quotes
@@ -82,8 +82,8 @@ LAUNCHER
 chmod +x "$SIM_APP_DIR/Contents/MacOS/launcher"
 echo "    built: $SIM_APP_DIR"
 
-echo "==> Building Sputter Remote.app..."
-REMOTE_APP_DIR="$(scaffold_app "Sputter Remote" "com.aryanv.sputterctrl.remote")"
+echo "==> Building VacDep Remote.app..."
+REMOTE_APP_DIR="$(scaffold_app "VacDep Remote" "com.aryanv.vacdepoctrl.remote")"
 # Two-stage: pick a rig from RIGS (skipped automatically when there's only
 # one), then hand the ssh command to Terminal the same way Simulation does.
 # The SSH password itself is deliberately left to ssh's own normal
@@ -101,7 +101,7 @@ cat > "$REMOTE_APP_DIR/Contents/MacOS/launcher" <<'LAUNCHER'
 # scripts/build_mac_launchers.sh to rebuild this app -- 1 entry auto-
 # connects with no prompt, 2+ shows a choose-from-list dialog.
 RIGS=(
-	"raspberrypi@av.local|Sputter Vacuum Controller"
+	"raspberrypi@av.local|VacDepoctrl (sputter rig)"
 )
 
 if [ "${#RIGS[@]}" -eq 1 ]; then
@@ -131,7 +131,7 @@ TARGET="${SELECTED%%|*}"
 osascript <<APPLESCRIPT
 tell application "Terminal"
 	activate
-	do script "ssh -X $TARGET -t '/home/raspberrypi/Sputter_ctrl/venv/bin/python /home/raspberrypi/Sputter_ctrl/main.py'"
+	do script "ssh -X $TARGET -t '/home/raspberrypi/VacDepoctrl/venv/bin/python /home/raspberrypi/VacDepoctrl/main.py'"
 end tell
 APPLESCRIPT
 LAUNCHER

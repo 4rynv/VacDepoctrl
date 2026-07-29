@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=VacDepoctrl
+Comment=Vacuum deposition controller (sputtering)
+Exec=/home/raspberrypi/VacDepoctrl/venv/bin/python /home/raspberrypi/VacDepoctrl/main.py
+Path=/home/raspberrypi/VacDepoctrl
+Icon=/home/raspberrypi/VacDepoctrl/assets/app-icon.png
+Terminal=true
+Categories=Utility;Science;
+StartupNotify=true

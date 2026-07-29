@@ -1,8 +1,8 @@
-# Sputter Vacuum Controller
+# VacDepoctrl — Vacuum Deposition Controller
 
-A Raspberry Pi-based vacuum process controller for DC magnetron sputter deposition. Manages chamber pump-down, argon gas flow, plasma ignition, and sputtering via a live Tkinter GUI with scrolling sensor graphs and a hardware-interlocked state machine.
+A Raspberry Pi-based vacuum process controller. The current process is DC magnetron sputter deposition — chamber pump-down, argon gas flow, plasma ignition, and sputtering via a live Tkinter GUI with scrolling sensor graphs and a hardware-interlocked state machine. A thermal evaporation mode is planned as a second process on the same rig control stack.
 
-![Sputter Vacuum Controller GUI](Docs/gui-screenshot.png)
+![VacDepoctrl GUI](docs/gui-screenshot.png)
 
 ---
 
@@ -59,7 +59,7 @@ Software bus speed is slower than hardware I2C; irrelevant at the 0.2 s polling 
 
 ### Voltage Divider (Pirani Output)
 
-The DHPG-015 outputs 0–10V. A 3-resistor voltage divider scales this to 0–3.3V for the ADS1115 (divider ratio 0.33). All pressure thresholds in `config.py` are expressed in post-divider (ADC-side) volts. The full manufacturer calibration table lives in `Docs/Di-Hi-Pr-Pirani output voltage.pdf` and is transcribed as `_PIRANI_CAL` in `main.py`.
+The DHPG-015 outputs 0–10V. A 3-resistor voltage divider scales this to 0–3.3V for the ADS1115 (divider ratio 0.33). All pressure thresholds in `config.py` are expressed in post-divider (ADC-side) volts. The full manufacturer calibration table lives in `hardware/datasheets/Di-Hi-Pr-Pirani output voltage.pdf` and is transcribed as `_PIRANI_CAL` in `main.py`.
 
 ### DAC Output Buffer + Level Shifter (LM358P)
 
@@ -266,31 +266,39 @@ The polling thread and GUI thread never share objects directly — all data pass
 ## File Structure
 
 ```
-Sputter_ctrl/
+VacDepoctrl/
 ├── main.py            — Entry point: GUI, polling thread, hardware init, cal table
 ├── config.py          — All constants, thresholds, and pin assignments
-├── state_machine.py   — SputterStateMachine class
-├── mfc_control.py     — MFCController class (DAC, valve, PID loop)
-├── pirani.py          — PiraniController class (ADC, turbo enable opto)
-├── turbo_rpm.py       — TurboRPMController class (ADC A2 tach → RPM)
-├── pzem_meter.py      — PZEMController class (PZEM-004T-100A, Modbus-RTU over USB-TTL)
-├── graph.py           — ScrollingGraph class (pure Tkinter, no matplotlib; single/dual/multi-series)
-├── sim_hardware.py    — ChamberSim + fake hardware modules for SPUTTER_SIM=1 (Simulation Mode)
-├── web_ui.py          — browser dashboard server (stdlib HTTP + SSE), parallel to the Tkinter GUI
-├── web/
-│   └── index.html     — the dashboard page (self-contained: inline CSS/JS, no CDN)
-├── setup.sh           — venv + dependency installer, also installs the desktop launcher
-├── Sputter_ctrl.desktop — desktop launcher icon (installed by setup.sh; see Installation)
-├── Docs/              — Pirani datasheet PDF, GUI screenshot, desktop/app icon source (app-icon*.png, AppIcon.icns)
+├── state_machine.py   — SputterStateMachine class (future: per-process state machines)
+├── drivers/           — one class per hardware device
+│   ├── mfc_control.py — MFCController class (DAC, valve, PID loop)
+│   ├── pirani.py      — PiraniController class (ADC, turbo enable opto)
+│   ├── turbo_rpm.py   — TurboRPMController class (ADC A2 tach → RPM)
+│   └── pzem_meter.py  — PZEMController class (PZEM-004T-100A, Modbus-RTU over USB-TTL)
+├── ui/
+│   ├── graph.py       — ScrollingGraph class (pure Tkinter, no matplotlib; single/dual/multi-series)
+│   ├── web_ui.py      — browser dashboard server (stdlib HTTP + SSE), parallel to the Tkinter GUI
+│   └── web/
+│       └── index.html — the dashboard page (self-contained: inline CSS/JS, no CDN)
+├── sim/
+│   └── sim_hardware.py — ChamberSim + fake hardware modules for SPUTTER_SIM=1 (Simulation Mode)
+├── hardware/
+│   ├── Raspi_HAT/     — KiCad project for the custom Raspberry Pi HAT (schematic/PCB/BOM)
+│   └── datasheets/    — Pirani gauge output-voltage table PDF
+├── docs/              — GUI screenshot and other README assets
+├── assets/            — desktop/app icon source (app-icon*.png, AppIcon.icns)
 ├── scripts/
+│   ├── setup.sh       — venv + dependency installer, also installs the desktop launcher
+│   ├── VacDepoctrl.desktop       — desktop launcher icon (installed by setup.sh; see Installation)
 │   ├── setup_remote_gui_macos.sh — one-time XQuartz setup, see Remote GUI Access
-│   └── build_mac_launchers.sh    — builds the Sputter Remote.app / Sputter Simulation.app Desktop icons
+│   └── build_mac_launchers.sh    — builds the VacDep Remote.app / VacDep Simulation.app Desktop icons
 └── tests/
     ├── adc_test.py         — ADS1115 read loop (bus 3)
     ├── dac_test.py         — MCP4725 sweep + readback (bus 3)
     ├── opto_test.py        — GPIO 17 turbo enable opto toggle
     ├── turbo_valve_test.py — GPIO 22 relay/valve toggle
-    └── pzem_test.py        — PZEM-004T-100A live reading loop (USB-TTL)
+    ├── pzem_test.py        — PZEM-004T-100A live reading loop (USB-TTL)
+    └── unit/               — hardware-free unit suite (fakes.py + test_all.py)
 ```
 
 ---
@@ -374,7 +382,7 @@ During VENTING the poll loop additionally holds the MFC valve **closed** every t
 
 ## Pressure Reference
 
-All voltages are post-divider (ADC input, ×0.33 from raw gauge output). Conversion between Pirani voltage and mbar uses **log-linear interpolation** against the full manufacturer calibration table (`_PIRANI_CAL` in `main.py`, source PDF in `Docs/`): linear in voltage, logarithmic in pressure, matching the gauge's thermal-conductivity response. Both directions are implemented (`mbar_to_adc_voltage`, `adc_voltage_to_mbar`) and round-trip to machine precision at all 51 table points.
+All voltages are post-divider (ADC input, ×0.33 from raw gauge output). Conversion between Pirani voltage and mbar uses **log-linear interpolation** against the full manufacturer calibration table (`_PIRANI_CAL` in `main.py`, source PDF in `hardware/datasheets/`): linear in voltage, logarithmic in pressure, matching the gauge's thermal-conductivity response. Both directions are implemented (`mbar_to_adc_voltage`, `adc_voltage_to_mbar`) and round-trip to machine precision at all 51 table points.
 
 | Pressure (mbar) | Raw gauge (V) | ADC input (V) | Significance |
 |---|---|---|---|
@@ -411,8 +419,8 @@ Transition-based, not level-based:
 
 ```bash
 ssh raspberrypi@<pi-ip>
-git clone https://github.com/<your-username>/Sputter_ctrl.git ~/Sputter_ctrl
-cd ~/Sputter_ctrl
+git clone https://github.com/<your-username>/VacDepoctrl.git ~/VacDepoctrl
+cd ~/VacDepoctrl
 ```
 
 ### 2. Enable the Software I2C Bus
@@ -434,16 +442,16 @@ i2cdetect -y 3
 ### 3. Run the Setup Script
 
 ```bash
-cd ~/Sputter_ctrl
-chmod +x setup.sh
-./setup.sh
+cd ~/VacDepoctrl
+chmod +x scripts/setup.sh
+./scripts/setup.sh
 ```
 
-This installs `adafruit-blinka`, `adafruit-circuitpython-ads1x15`, `adafruit-extended-bus`, `RPi.GPIO`, and `pyserial` into a venv at `~/Sputter_ctrl/venv/`, adds a `source_sputt` alias to `~/.bashrc`, and places a **Sputter Vacuum Controller** icon on the desktop (`Sputter_ctrl.desktop`) — double-click it to launch `main.py` directly, no terminal needed. First launch may need a one-time "Allow Launching" confirmation (right-click the icon → Allow Launching) depending on the desktop environment's trust settings for new `.desktop` files.
+This installs `adafruit-blinka`, `adafruit-circuitpython-ads1x15`, `adafruit-extended-bus`, `RPi.GPIO`, and `pyserial` into a venv at `~/VacDepoctrl/venv/`, adds a `source_vacdep` alias to `~/.bashrc`, and places a **VacDepoctrl** icon on the desktop (`VacDepoctrl.desktop`) — double-click it to launch `main.py` directly, no terminal needed. First launch may need a one-time "Allow Launching" confirmation (right-click the icon → Allow Launching) depending on the desktop environment's trust settings for new `.desktop` files.
 
 ```bash
 source ~/.bashrc
-source_sputt
+source_vacdep
 ```
 
 ### 4. (Optional) Energy Meter Serial Permissions
@@ -464,8 +472,8 @@ This step can be skipped entirely — the meter is optional hardware and `main.p
 Must be run on the Pi with a display connected (HDMI or VNC), not over a plain SSH session.
 
 ```bash
-source_sputt
-cd ~/Sputter_ctrl
+source_vacdep
+cd ~/VacDepoctrl
 python main.py
 ```
 
@@ -475,7 +483,7 @@ To run over SSH with display forwarding:
 
 ```bash
 ssh -X raspberrypi@<pi-ip>
-source_sputt && cd ~/Sputter_ctrl && python main.py
+source_vacdep && cd ~/VacDepoctrl && python main.py
 ```
 
 This renders the GUI on your own machine instead of the Pi's local display —
@@ -532,7 +540,7 @@ Then from a **new** terminal (so it picks up XQuartz's environment):
 
 ```bash
 ssh -X raspberrypi@<pi-ip>
-source_sputt && cd ~/Sputter_ctrl && python main.py
+source_vacdep && cd ~/VacDepoctrl && python main.py
 ```
 
 If the window doesn't appear, try `-Y` (trusted forwarding, fewer
@@ -550,9 +558,9 @@ above doesn't work.
 
 **Desktop launcher (optional):** once XQuartz is set up, `./scripts/build_mac_launchers.sh`
 builds two double-clickable `.app` icons on the Desktop — the Mac
-equivalent of `Sputter_ctrl.desktop` on the Pi:
+equivalent of `VacDepoctrl.desktop` on the Pi:
 
-- **Sputter Remote.app** — picks a rig from a small known-rigs list baked
+- **VacDep Remote.app** — picks a rig from a small known-rigs list baked
   into the app (edit `RIGS` in `scripts/build_mac_launchers.sh` and rebuild
   to add more — one entry auto-connects with no prompt, several show a
   choose-from-list dialog), then runs the `ssh -X` command above for you.
@@ -561,7 +569,7 @@ equivalent of `Sputter_ctrl.desktop` on the Pi:
   that. The SSH password itself is left to `ssh`'s own normal interactive
   Terminal prompt (secure, no extra tooling) rather than something like
   `sshpass`.
-- **Sputter Simulation.app** — runs Simulation Mode locally (see below);
+- **VacDep Simulation.app** — runs Simulation Mode locally (see below);
   no Pi or XQuartz-to-Pi connection needed, just XQuartz itself.
 
 Both open Terminal.app rather than running silently, since `main.py`'s
@@ -589,7 +597,7 @@ Two options — pick one:
   **Connection → SSH → X11 → Enable X11 forwarding** (X display location
   `localhost:0`) before connecting.
 
-Either way, once connected: `source_sputt && cd ~/Sputter_ctrl && python main.py`.
+Either way, once connected: `source_vacdep && cd ~/VacDepoctrl && python main.py`.
 
 ### Linux
 
@@ -599,7 +607,7 @@ out of the box; a Wayland desktop on Linux ships `Xwayland` by default too
 
 ```bash
 ssh -X raspberrypi@<pi-ip>
-source_sputt && cd ~/Sputter_ctrl && python main.py
+source_vacdep && cd ~/VacDepoctrl && python main.py
 ```
 
 ---
@@ -614,8 +622,8 @@ http://av.local:8080          (or http://<pi-ip>:8080)
 ```
 
 No app, no XQuartz, no SSH, no per-OS setup; works from a phone. Served by
-`web_ui.py` (stdlib HTTP + Server-Sent Events — nothing to install) with the
-page in `web/index.html` (self-contained, no CDN: renders on a LAN with no
+`ui/web_ui.py` (stdlib HTTP + Server-Sent Events — nothing to install) with the
+page in `ui/web/index.html` (self-contained, no CDN: renders on a LAN with no
 internet).
 
 **Parallel by design, never a replacement.** The web dashboard is a second
@@ -647,13 +655,13 @@ selectable field with a Copy button for exactly this reason.
 
 > [!warning] Deploy this feature as a set, not piecemeal
 > `WEB_UI_ENABLED` lives in `config.py`, but the code it depends on
-> (`web_ui.py`, `web/index.html`) are separate files. A partial `scp` that
+> (`ui/web_ui.py`, `ui/web/index.html`) are separate files. A partial `scp` that
 > ships a `config.py` with `WEB_UI_ENABLED = True` but not the other two
 > crashes `main.py` on startup with `ModuleNotFoundError: No module named
 > 'web_ui'` — **every** launch path fails identically (desktop icon, SSH -X,
 > plain SSH), since the crash happens at import time before Tkinter ever
 > gets a chance to open a window. Hit and fixed 2026-07-12. Always deploy
-> `config.py` together with `web_ui.py` + `web/index.html`, or set
+> `config.py` together with the whole `ui/` folder, or set
 > `WEB_UI_ENABLED = False` on the Pi if you're deliberately deploying
 > without the dashboard for now.
 
@@ -672,7 +680,7 @@ SPUTTER_SIM=1 python main.py
 python main.py --sim
 ```
 
-`sim_hardware.py` installs fake `RPi.GPIO` / `adafruit_ads1x15` /
+`sim/sim_hardware.py` installs fake `RPi.GPIO` / `adafruit_ads1x15` /
 `adafruit_extended_bus` / `serial` modules into `sys.modules` before
 `main.py`'s own hardware imports run (the same technique the hardware-free
 test suite uses) — but unlike the test suite's static, manually-set values,
@@ -694,7 +702,7 @@ the Controls panel — click it whenever you want to simulate the plasma
 actually igniting; it stays exactly as set until toggled again.
 
 On macOS, `./scripts/build_mac_launchers.sh` builds a double-clickable
-**Sputter Simulation.app** — see [Remote GUI Access](#remote-gui-access) above.
+**VacDep Simulation.app** — see [Remote GUI Access](#remote-gui-access) above.
 
 ---
 
@@ -825,7 +833,7 @@ models (SECS/GEM), and fault detection built on ruthless data collection.
       unpetted) — deliberately deferred, separate systemd/infra decision with its
       own tradeoffs (what state GPIOs land in across a forced reboot)
 - [~] **Simulation mode**: fake-hardware flag so the full state machine + GUI run on
-      any laptop — `sim_hardware.py`, `SPUTTER_SIM=1 python main.py` or `--sim`.
+      any laptop — `sim/sim_hardware.py`, `SPUTTER_SIM=1 python main.py` or `--sim`.
       Extends the unit suite's static test fakes into a live interactive sim with a
       simple first-order physics model (`ChamberSim`) that reacts to real GPIO/DAC/
       serial writes from the actual control loop, not canned values

@@ -6,7 +6,7 @@ Run from the repo root on any machine (no Pi, no sensors, no I2C needed):
     python3 -m unittest discover tests/unit -v
 
 Fake hardware modules are installed before the controller code is imported,
-so pirani.py / mfc_control.py / state_machine.py run exactly as written.
+so drivers/pirani.py / drivers/mfc_control.py / state_machine.py run exactly as written.
 main.py is NOT imported (it starts the GUI); its calibration table and
 interpolation functions are extracted from source and tested directly.
 """
@@ -25,14 +25,14 @@ fakes.install()
 
 import config
 from state_machine import SputterStateMachine, VALID_TRANSITIONS, STATE_COLORS
-import mfc_control
-import pirani as pirani_mod
-from mfc_control import MFCController
-from pirani import PiraniController
-from turbo_rpm import TurboRPMController
-from pzem_meter import PZEMController
-from sim_hardware import ChamberSim
-from web_ui import WebUI
+from drivers import mfc_control
+from drivers import pirani as pirani_mod
+from drivers.mfc_control import MFCController
+from drivers.pirani import PiraniController
+from drivers.turbo_rpm import TurboRPMController
+from drivers.pzem_meter import PZEMController
+from sim.sim_hardware import ChamberSim
+from ui.web_ui import WebUI
 from fakes import FakeADS1115, FakeI2C, FakeSerial, gpio
 
 CAL = fakes.load_calibration(REPO_ROOT)
@@ -1430,7 +1430,7 @@ class TestWebUI(unittest.TestCase):
                 "fail_cmd": lambda v: (False, "guard rejected it"),
                 "boom":     lambda v: 1 / 0,
             },
-            page_path=os.path.join(REPO_ROOT, "web", "index.html"),
+            page_path=os.path.join(REPO_ROOT, "ui", "web", "index.html"),
             port=0,                  # ephemeral -- avoids clashes between test runs
             update_interval=0.02,
         )
