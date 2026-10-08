@@ -29,16 +29,31 @@ A Raspberry Pi-based vacuum process controller. The current process is DC magnet
 
 | Component | Model | Interface | Notes |
 |---|---|---|---|
-| Microcontroller | Raspberry Pi 2B (BCM GPIO) | — | Host for all control logic |
+| Microcontroller | Raspberry Pi 5 (BCM GPIO) | — | Host for all control logic |
 | Pirani gauge | ACE Instruments DHPG-015 | Analog 0–10V | Divided to 0–3.3V before ADC (ratio 0.33) |
-| ADC | ADS1115 | **I2C bus 3** @ 0x48 | Pirani on A0 (divided), MFC feedback on A1 (divided), turbo RPM tach on A2 |
+| ADC | ADS1115 | **I2C bus 1** @ 0x48 | Pirani on A0 (divided), MFC feedback on A1 (divided), turbo RPM tach on A2 |
 | MFC | MKS 1179A | Analog 0–5V setpoint | 0–700 sccm Argon |
-| DAC | MCP4725 | **I2C bus 3** @ 0x60 | Level-shifted to the MFC's full 0–5V setpoint range — see below |
+| DAC | MCP4725 | **I2C bus 1** @ 0x60 | Level-shifted to the MFC's full 0–5V setpoint range — see below |
 | DAC buffer | LM358P op-amp | Analog | Buffers + level-shifts the DAC output up to 0–5V; DAC alone cannot drive the MFC setpoint input |
 | Turbo enable | Opto-isolator (4N35) | GPIO 17 (BCM, phys 11) | Marginal — needs BC547 output buffer, see below |
 | MFC valve close | Emergency shut | GPIO 27 (BCM, phys 13) | Pulls MFC valve closed on demand |
 | Turbo inlet valve | Relay via BC547 | **GPIO 22 (BCM, phys 15)** | HIGH = valve OPEN, LOW = valve CLOSED (relay NC contact) |
 | Energy meter | PZEM-004T-100A | Modbus-RTU over CP2102 USB-TTL, `/dev/ttyUSB0` | AC voltage/current/power on the variac output; plasma-ignition sensing. **Optional at startup** — see below |
+
+### Raspberry Pi pin connections
+
+[Full 40-pin header and device wiring diagram](docs/pinout.md)
+
+| Function | BCM GPIO | Physical header pin | Connection |
+|---|---|---|---|
+| I2C1 SDA | GPIO2 | **3** | ADS1115 SDA + MCP4725 SDA |
+| I2C1 SCL | GPIO3 | **5** | ADS1115 SCL + MCP4725 SCL |
+| Signal ground | — | **6** (or another GND) | ADC/DAC signal ground |
+| Turbo enable | GPIO17 | **11** | Opto-isolator input circuit |
+| MFC emergency close | GPIO27 | **13** | Existing MFC valve-close interface |
+| Turbo inlet valve | GPIO22 | **15** | BC547 relay-driver input |
+
+GPIO23/24 (physical pins 16/18) are no longer the I2C connection.
 
 ### I2C: Hardware Bus 1 on GPIO 2/3
 
@@ -234,7 +249,7 @@ The turbo enable opto (GPIO 17) currently only works with excess LED drive; the 
 
 ```
 main.py
-├── Hardware init (GPIO, ExtendedI2C bus 3, ADS1115)
+├── Hardware init (GPIO, ExtendedI2C bus 1, ADS1115)
 ├── Shared state dict (thread-safe, _lock)
 ├── Polling thread (_poll) — runs every POLLING_INTERVAL (0.2s)
 │   ├── Reads Pirani + MFC + turbo RPM (A2) + PZEM (variac current) sensors
@@ -299,8 +314,8 @@ VacDepoctrl/
 │   ├── setup_remote_gui_macos.sh — one-time XQuartz setup, see Remote GUI Access
 │   └── build_mac_launchers.sh    — builds the VacDep Remote.app / VacDep Simulation.app Desktop icons
 └── tests/
-    ├── adc_test.py         — ADS1115 read loop (bus 3)
-    ├── dac_test.py         — MCP4725 sweep + readback (bus 3)
+    ├── adc_test.py         — ADS1115 read loop (bus 1)
+    ├── dac_test.py         — MCP4725 sweep + readback (bus 1)
     ├── opto_test.py        — GPIO 17 turbo enable opto toggle
     ├── turbo_valve_test.py — GPIO 22 relay/valve toggle
     ├── pzem_test.py        — PZEM-004T-100A live reading loop (USB-TTL)
@@ -509,7 +524,7 @@ python tests/turbo_valve_test.py  # GPIO 22 relay/valve toggle every 5 s
 ## Remote GUI Access
 
 **Why**: Raspberry Pi OS Bookworm's default desktop uses a Wayland compositor
-(`labwc`). On older/weaker boards (this rig runs a Pi 2B) that compositor can
+(`labwc`). On older/weaker boards that compositor can
 alone consume most of the CPU just keeping the desktop alive — independent of
 `main.py` — which shows up as system-wide lag, including the mouse cursor
 itself stuttering. Tkinter also doesn't speak Wayland natively; on this
