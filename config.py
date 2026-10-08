@@ -29,8 +29,8 @@ VENTING_PUMP_OFF_PROMPT_RPM = 2000  # During VENTING, once turbo RPM drops to/be
 # ════════════════════════════════════════════════════════
 #  I2C BUS
 # ════════════════════════════════════════════════════════
-I2C_BUS_NUMBER = 3   # software i2c-gpio on GPIO23/24 (physical pins 16/18),
-                     # enabled via dtoverlay in /boot/firmware/config.txt
+I2C_BUS_NUMBER = 1   # hardware I2C on GPIO2/3 (physical pins 3/5),
+                     # enabled via dtparam=i2c_arm=on in /boot/firmware/config.txt
 
 # ════════════════════════════════════════════════════════
 #  ADC CONFIGURATION

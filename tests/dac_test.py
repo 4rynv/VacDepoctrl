@@ -58,8 +58,8 @@ def wait_dac_ready(i2c, timeout=2.0):
     return False, buf
 
 
-# bus 3 = software i2c-gpio: SDA=GPIO23 (pin 16), SCL=GPIO24 (pin 18)
-with ExtendedI2C(3) as i2c:
+# bus 1 = hardware I2C: SDA=GPIO2 (pin 3), SCL=GPIO3 (pin 5)
+with ExtendedI2C(1) as i2c:
     print("Scanning I2C bus...")
     while not i2c.try_lock():
         pass

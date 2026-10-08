@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Run once: ~/VacDepoctrl/scripts/setup.sh
 # # ─────────────────────────────────────────────
 #
@@ -9,7 +10,7 @@ echo "==> Repo directory : $REPO_DIR"
 #
 # # ── 1. System dependencies ───────────────────
 echo "==> Installing system packages..."
-sudo apt install -y python3-pip python3-venv python3-full
+sudo apt install -y python3-pip python3-venv python3-full python3-tk
 #
 # # ── 2. Create venv ───────────────────────────
 echo "==> Creating virtual environment..."
@@ -22,8 +23,12 @@ echo "==> Installing Python packages..."
 				adafruit-blinka \
 				adafruit-circuitpython-ads1x15 \
 				adafruit-extended-bus \
-				RPi.GPIO \
 				pyserial
+# Blinka currently pulls in legacy RPi.GPIO; replace it after dependency resolution.
+# Force reinstall restores the shared RPi.GPIO namespace on repeated setup runs.
+"$REPO_DIR/venv/bin/python" -m pip uninstall -y RPi.GPIO
+"$REPO_DIR/venv/bin/python" -m pip install --force-reinstall --no-deps rpi-lgpio
+
 # # ── 4. Fix alias in ~/.bashrc ─────────────────
 echo "==> Updating source_vacdep alias in ~/.bashrc..."
 # Drop the pre-rename alias if present (pointed at ~/Sputter_ctrl)
@@ -50,7 +55,13 @@ echo "==> Verifying installation..."
 # # ── 6. Desktop launcher icon ──────────────────
 echo "==> Installing desktop launcher..."
 if [ -d "$HOME/Desktop" ]; then
-	cp "$REPO_DIR/scripts/VacDepoctrl.desktop" "$HOME/Desktop/VacDepoctrl.desktop"
+	"$REPO_DIR/venv/bin/python" - "$REPO_DIR" "$HOME/Desktop/VacDepoctrl.desktop" <<'PYDESKTOP'
+from pathlib import Path
+import sys
+repo = Path(sys.argv[1])
+template = (repo / "scripts/VacDepoctrl.desktop").read_text()
+Path(sys.argv[2]).write_text(template.replace("@REPO_DIR@", str(repo)))
+PYDESKTOP
 	chmod +x "$HOME/Desktop/VacDepoctrl.desktop"
 	# PCManFM/Nautilus-style file managers refuse to run an untrusted
 	# .desktop file until told to; gio marks it trusted automatically where

@@ -40,22 +40,28 @@ A Raspberry Pi-based vacuum process controller. The current process is DC magnet
 | Turbo inlet valve | Relay via BC547 | **GPIO 22 (BCM, phys 15)** | HIGH = valve OPEN, LOW = valve CLOSED (relay NC contact) |
 | Energy meter | PZEM-004T-100A | Modbus-RTU over CP2102 USB-TTL, `/dev/ttyUSB0` | AC voltage/current/power on the variac output; plasma-ignition sensing. **Optional at startup** — see below |
 
-### I2C: Software Bus 3 on GPIO 23/24
+### I2C: Hardware Bus 1 on GPIO 2/3
 
-I2C runs as a **bit-banged software bus** via device-tree overlay in `/boot/firmware/config.txt`:
+The Pi 5 uses hardware I2C1 at 100 kHz. Configure `/boot/firmware/config.txt`:
 
-```
-dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=24,i2c_gpio_delay_us=2
+```ini
+dtparam=i2c_arm=on
+dtparam=i2c_arm_baudrate=100000
 ```
 
 | Signal | BCM | Physical pin |
 |---|---|---|
-| SDA | GPIO 23 | 16 |
-| SCL | GPIO 24 | 18 |
+| SDA | GPIO 2 | 3 |
+| SCL | GPIO 3 | 5 |
+| GND | Ground | 6 |
 
-The code opens the bus with `ExtendedI2C(I2C_BUS_NUMBER)` from `adafruit-extended-bus` (bus number set in `config.py`; switch back to `1` if hardware I2C is ever restored). **Note:** unlike pins 3/5, GPIO 23/24 have no on-board pull-ups — the breakout boards' 10 kΩ pull-ups are what keeps the bus alive. Bare chips would need external 4.7 kΩ pull-ups to 3.3 V.
-
-Software bus speed is slower than hardware I2C; irrelevant at the 0.2 s polling rate. A harmless "I2C frequency is not settable in python" warning is printed at startup.
+Connect both ADS1115 and MCP4725 to this bus; keep pull-ups at 3.3 V.
+Power down before moving SDA/SCL from the previous GPIO23/24 wiring.
+The code uses `ExtendedI2C(I2C_BUS_NUMBER)` with `I2C_BUS_NUMBER = 1`.
+The older software-bus setup was a workaround for reported damaged GPIO2/3
+on a previous setup; this configuration assumes functioning GPIO2/3.
+Reboot after changing boot configuration; the operator performs device checks
+and the first controller launch with equipment in a safe condition.
 
 ### Voltage Divider (Pirani Output)
 
@@ -418,26 +424,25 @@ Transition-based, not level-based:
 ### 1. Clone the Repository
 
 ```bash
-ssh raspberrypi@<pi-ip>
+ssh av@<pi-ip>
 git clone https://github.com/<your-username>/VacDepoctrl.git ~/VacDepoctrl
 cd ~/VacDepoctrl
 ```
 
-### 2. Enable the Software I2C Bus
+### 2. Enable Hardware I2C
 
-Hardware I2C (pins 3/5) is dead on this Pi — the software bus overlay is **required**. Append to `/boot/firmware/config.txt` and reboot:
+Wire physical pins 3/5 as described above. Enable these settings under `[all]`
+in `/boot/firmware/config.txt`, removing any old `i2c-gpio` overlay:
 
-```bash
-echo "dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=24,i2c_gpio_delay_us=2" | sudo tee -a /boot/firmware/config.txt
-sudo reboot
+```ini
+dtparam=i2c_arm=on
+dtparam=i2c_arm_baudrate=100000
 ```
 
-Verify both devices are visible:
-
-```bash
-i2cdetect -y 3
-# Should show 0x48 (ADS1115) and 0x60 (MCP4725)
-```
+The operator should reboot when safe, then verify `/dev/i2c-1` exists.
+Hardware verification should find ADS1115 at 0x48 and MCP4725 at 0x60.
+Do not launch the controller until the wiring and equipment are ready:
+`main.py` configures outputs immediately and can automatically enter PUMP_DOWN.
 
 ### 3. Run the Setup Script
 
@@ -447,7 +452,7 @@ chmod +x scripts/setup.sh
 ./scripts/setup.sh
 ```
 
-This installs `adafruit-blinka`, `adafruit-circuitpython-ads1x15`, `adafruit-extended-bus`, `RPi.GPIO`, and `pyserial` into a venv at `~/VacDepoctrl/venv/`, adds a `source_vacdep` alias to `~/.bashrc`, and places a **VacDepoctrl** icon on the desktop (`VacDepoctrl.desktop`) — double-click it to launch `main.py` directly, no terminal needed. First launch may need a one-time "Allow Launching" confirmation (right-click the icon → Allow Launching) depending on the desktop environment's trust settings for new `.desktop` files.
+This installs `adafruit-blinka`, `adafruit-circuitpython-ads1x15`, `adafruit-extended-bus`, `rpi-lgpio` (providing the `RPi.GPIO` API), and `pyserial` into a venv at `~/VacDepoctrl/venv/`, adds a `source_vacdep` alias to `~/.bashrc`, and places a **VacDepoctrl** icon on the desktop (`VacDepoctrl.desktop`) — double-click it to launch `main.py` directly, no terminal needed. First launch may need a one-time "Allow Launching" confirmation (right-click the icon → Allow Launching) depending on the desktop environment's trust settings for new `.desktop` files.
 
 ```bash
 source ~/.bashrc
@@ -482,7 +487,7 @@ python main.py
 To run over SSH with display forwarding:
 
 ```bash
-ssh -X raspberrypi@<pi-ip>
+ssh -X av@<pi-ip>
 source_vacdep && cd ~/VacDepoctrl && python main.py
 ```
 
@@ -539,7 +544,7 @@ open -a XQuartz
 Then from a **new** terminal (so it picks up XQuartz's environment):
 
 ```bash
-ssh -X raspberrypi@<pi-ip>
+ssh -X av@<pi-ip>
 source_vacdep && cd ~/VacDepoctrl && python main.py
 ```
 
@@ -606,7 +611,7 @@ out of the box; a Wayland desktop on Linux ships `Xwayland` by default too
 (unlike macOS/Windows, which have no X server at all). Just:
 
 ```bash
-ssh -X raspberrypi@<pi-ip>
+ssh -X av@<pi-ip>
 source_vacdep && cd ~/VacDepoctrl && python main.py
 ```
 
@@ -712,7 +717,7 @@ All tunable parameters are in `config.py`. Key constants:
 
 ```python
 # I2C
-I2C_BUS_NUMBER               = 3       # software i2c-gpio bus (1 = dead hardware bus)
+I2C_BUS_NUMBER               = 1       # hardware I2C1 on GPIO2/3
 ADS1115_I2C_ADDRESS          = 0x48
 ARGON_DAC_I2C_ADDRESS        = 0x60
 
@@ -892,3 +897,11 @@ models (SECS/GEM), and fault detection built on ruthless data collection.
       microcontroller under the Pi (the SputterOS-shaped slot in this architecture)
 - [ ] **Replicable kit**: documentation and BOM good enough that another lab can
       build this machine from the repo alone
+
+### Pi 5 GPIO dependency note
+
+Blinka 9.2.0 declares a dependency on legacy `RPi.GPIO`. Setup installs Blinka
+first, then replaces that package with `rpi-lgpio` for Pi 5 support. Do not
+install both together. `pip check` currently reports Blinka's missing `RPi.GPIO`
+distribution even though `import RPi.GPIO` is supplied by `rpi-lgpio`. Re-run
+setup after dependency upgrades that reinstall the legacy package.

@@ -70,13 +70,13 @@ class TestConfigSanity(unittest.TestCase):
                 config.GPIO_TURBO_VALVE_PIN]
         self.assertEqual(len(pins), len(set(pins)), "GPIO pin collision")
 
-    def test_pins_avoid_dead_pads(self):
-        # GPIO 2/3/4 are non-functional on this board; 23/24 are reserved for the I2C bus
-        forbidden = {2, 3, 4, 23, 24}
+    def test_pins_avoid_i2c_bus(self):
+        # Hardware I2C1 reserves GPIO2/3.
+        forbidden = {2, 3}
         for pin in (config.GPIO_PIRANI_PIN,
                     config.GPIO_MFC_VALVE_CLOSE_PIN,
                     config.GPIO_TURBO_VALVE_PIN):
-            self.assertNotIn(pin, forbidden, f"GPIO{pin} is dead or reserved")
+            self.assertNotIn(pin, forbidden, f"GPIO{pin} is reserved for I2C")
 
     def test_pid_gains_sane(self):
         self.assertGreaterEqual(config.PRESSURE_CONTROL_KI, 0.0)
@@ -95,9 +95,8 @@ class TestConfigSanity(unittest.TestCase):
         self.assertGreater(config.ARGON_DAC_VREF, 0.0)
         self.assertGreater(config.MFC_FULL_SCALE, 0.0)
 
-    def test_i2c_bus_is_software_bus(self):
-        # hardware bus 1 pads (GPIO2/3) are dead — bus must be 3
-        self.assertEqual(config.I2C_BUS_NUMBER, 3)
+    def test_i2c_bus_is_hardware_bus(self):
+        self.assertEqual(config.I2C_BUS_NUMBER, 1)
 
     def test_turbo_valve_threshold(self):
         self.assertGreater(config.TURBO_VALVE_OPEN_RPM_MAX, 0.0)

@@ -8,10 +8,10 @@ from adafruit_extended_bus import ExtendedI2C
 
 # -----------------------------------
 # Initialize I2C
-# bus 3 = software i2c-gpio: SDA=GPIO23 (pin 16), SCL=GPIO24 (pin 18)
+# bus 1 = hardware I2C: SDA=GPIO2 (pin 3), SCL=GPIO3 (pin 5)
 # -----------------------------------
 
-i2c = ExtendedI2C(3)
+i2c = ExtendedI2C(1)
 
 # -----------------------------------
 # Initialize ADS1115
